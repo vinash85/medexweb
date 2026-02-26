@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head><title>DermatoAI Adjudicator</title></head>
+<body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; max-width:1150px; margin:auto;">
+        <div style="background:white; padding:25px; border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.1);">
+            <h3 id="stat" style="margin-top:0;">Initializing...</h3>
+            <div style="background:black; height:450px; display:flex; align-items:center; justify-content:center; border-radius:10px; overflow:hidden;">
+                <img id="img" src="" style="max-width:100%; max-height:100%;">
+            </div>
+            <p style="margin-top:15px;"><strong>Target File:</strong> <span id="filename">--</span></p>
+        </div>
+
+        <div style="background:white; padding:25px; border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.1);">
+            <div style="display:flex; justify-content:space-between; background:#e9ecef; padding:15px; border-radius:8px; font-weight:bold; font-size:1.2em;">
+                <span>AI CODE: <span id="ai" style="color:#007bff;">--</span></span>
+                <span>GT CODE: <span id="gt" style="color:#dc3545;">--</span></span>
+            </div>
+            <pre id="console" style="background:#1e1e1e; color:#4ade80; padding:20px; height:380px; overflow-y:auto; white-space:pre-wrap; border-radius:8px; margin-top:15px; font-family:monospace; font-size:13px; border:1px solid #333;">System ready. Click below to analyze image.</pre>
+            <button id="btn" onclick="run()" style="width:100%; padding:20px; background:#007bff; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:bold; margin-top:15px; font-size:1.1em;">RUN ADJUDICATION PIPELINE</button>
+        </div>
+    </div>
+
+    <script>
+        let queue = [], idx = 0;
+
+        async function init() {
+            try {
+                const res = await fetch('/api/list-images');
+                queue = await res.json();
+                if(queue.length > 0) updateDisplay();
+            } catch (e) { document.getElementById('stat').innerText = "Connection Error"; }
+        }
+
+        function updateDisplay() {
+            const currentFile = queue[idx];
+            document.getElementById('stat').innerText = `Examination: ${idx + 1} of ${queue.length}`;
+            document.getElementById('filename').innerText = currentFile;
+            document.getElementById('img').src = `/images/${currentFile}`;
+            document.getElementById('ai').innerText = "--";
+            document.getElementById('gt').innerText = "--";
+        }
+
+        async function run() {
+            if(idx >= queue.length) return;
+            const btn = document.getElementById('btn');
+            const con = document.getElementById('console');
+            const target = queue[idx];
+
+            btn.disabled = true;
+            con.innerText = `>>> [ACTION] ANALYZING: ${target}\n>>> [STEP 1] Loading specialist.gguf...\n>>> [STEP 2] Running 4-Point visual inspection...`;
+
+            try {
+                const response = await fetch('/api/analyze', {
+                    method:'POST', 
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({filename: target})
+                });
+                const data = await response.json();
+
+                // Show report for the current image
+                document.getElementById('ai').innerText = data.ai_code;
+                document.getElementById('gt').innerText = data.gt_code;
+                con.innerText = data.final_implication;
+
+                // Move to next image after a brief delay
+                setTimeout(() => {
+                    idx++;
+                    if(idx < queue.length) {
+                        updateDisplay();
+                        con.innerText += `\n\n--- COMPLETED ---\nNext target loaded.`;
+                    } else {
+                        document.getElementById('stat').innerText = "Queue Complete";
+                        con.innerText += `\n\n--- ALL TARGETS PROCESSED ---`;
+                    }
+                    btn.disabled = false;
+                }, 800);
+
+            } catch (e) {
+                con.innerText = "CRITICAL ERROR: " + e;
+                btn.disabled = false;
+            }
+        }
+        init();
+    </script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+*.gguf
+*.zip
+data/images/
+data/*.jpg
+__pycache__/
+*.pyc
+models/

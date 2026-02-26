@@ -1,0 +1,25 @@
+<script>
+    function uploadAndAnalyze() {
+        const formData = new FormData();
+        formData.append('image', document.getElementById('imageInput').files[0]);
+
+        // Show UI Loading
+        document.getElementById('loading').classList.remove('hidden');
+
+        fetch('/analyze', { method: 'POST', body: formData })
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('loading').classList.add('hidden');
+                document.getElementById('results').classList.remove('hidden');
+                
+                // Populate the 4 Specialist Boxes
+                data.specialists.forEach((text, i) => {
+                    document.getElementById(`desc${i}`).innerText = text;
+                });
+                
+                // Populate Final Diagnosis
+                document.getElementById('finalDx').innerText = data.diagnosis;
+                document.getElementById('displayImg').src = data.image_url;
+            });
+    }
+</script>
