@@ -1,19 +1,79 @@
 import os
 import gc
+import re
 import json
 import uuid
 import time
+import base64
 from PIL import Image, ImageEnhance, ImageFilter
 from llama_cpp import Llama
+from llama_cpp.llama_chat_format import register_chat_format, ChatFormatterResponse
+
+# Raw pass-through handler for PaliGemma base — no chat template wrapping
+@register_chat_format("paligemma-raw")
+def paligemma_raw_handler(messages, **kwargs):
+    prompt = ""
+    for msg in messages:
+        if isinstance(msg["content"], list):
+            for part in msg["content"]:
+                if part["type"] == "text":
+                    prompt += part["text"]
+        elif isinstance(msg["content"], str):
+            prompt += msg["content"]
+    return ChatFormatterResponse(prompt=prompt + "\n")
+
+# --- MedGemma direct-answer handler (bypasses thinking mode) ---
+@register_chat_format("medgemma-direct")
+def medgemma_direct_handler(messages, **kwargs):
+    prompt = ""
+    for msg in messages:
+        role = msg.get("role", "user")
+        prompt += f"<start_of_turn>{role}\n"
+        if isinstance(msg["content"], list):
+            for part in msg["content"]:
+                if part["type"] == "text":
+                    prompt += part["text"]
+        elif isinstance(msg["content"], str):
+            prompt += msg["content"]
+        prompt += "<end_of_turn>\n"
+    # Force model to start with "Answer:" to skip thinking mode
+    prompt += "<start_of_turn>model\nAnswer:"
+    return ChatFormatterResponse(prompt=prompt)
 
 # --- CONFIGURATION ---
 MODEL_DIR = "/home/project/models"
 DATA_DIR = "/home/project/data/images"
-SPECIALIST_PATH = os.path.join(MODEL_DIR, "specialist.gguf")
-SPECIALIST_PROJ = os.path.join(MODEL_DIR, "specialist-mmproj.gguf")
+# Phase 1 Specialist: MedGemma multimodal (testing bias reduction)
+SPECIALIST_PATH = os.path.join(MODEL_DIR, "medgemma.gguf")
+SPECIALIST_PROJ = os.path.join(MODEL_DIR, "medgemma-mmproj.gguf")
 MEDGEMMA_PATH = os.path.join(MODEL_DIR, "medgemma.gguf")
 
+def clean_response(val, key=None):
+    """Strip markdown artifacts and trailing explanations from model output."""
+    val = val.replace("*", "")
+    val = val.split("\n")[0].strip()
+    val = val.rstrip(".")
+    val = re.sub(r"\s+", " ", val).strip()
+
+    if key == "Structures":
+        found = [s for s in ["dots", "globules", "streaks"] if s in val]
+        val = ", ".join(found) if found else "none"
+
+    if key == "Colors":
+        known_colors = ["red", "white", "blue", "black", "brown", "yellow", "pink", "orange", "gray", "tan"]
+        found = [c for c in known_colors if c in val]
+        val = ", ".join(found) if found else "unknown"
+
+    return val
+
+
 class DermPipeline:
+    def _encode_image_base64(self, image_path: str) -> str:
+        """Read image file and return a data URI for llama-cpp-python chat API."""
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
     def _prepare_image(self, filename: str) -> str:
         original_path = os.path.join(DATA_DIR, filename)
         # Unique input filename forces the CLIP projector to bypass cached embeddings
@@ -31,46 +91,52 @@ class DermPipeline:
         print(f"\n[BACKEND] >>> STARTING FRESH ANALYSIS: {filename}")
         
         try:
-            # PHASE 1: Specialist (The Vision Model)
+            # PHASE 1: Specialist (The Vision Model - MedGemma multimodal)
             # Re-initializing here is heavy, but essential to clear internal KV-cache
             vlm = Llama(
-                model_path=SPECIALIST_PATH, 
-                clip_model_path=SPECIALIST_PROJ, 
-                n_ctx=1024, 
-                n_gpu_layers=-1, 
+                model_path=SPECIALIST_PATH,
+                clip_model_path=SPECIALIST_PROJ,
+                n_ctx=2048,
+                n_gpu_layers=-1,
+                chat_format="medgemma-direct",
                 verbose=False
             )
             
-            # Using a random seed for every image to break deterministic loops
-            current_seed = int(time.time())
-            
+            # Encode the processed image as base64 data URI for the chat API
+            image_uri = self._encode_image_base64(processed_path)
+
+            # PaliGemma format (answer en mode) — not supported by MedGemma
+            # obs_queries = {
+            #     "Architecture": "answer en What is the shape of this image? round, oval, or irregular?",
+            #     "Network": "answer en Does this lesion have a pigment network? yes or no",
+            #     "Structures": "answer en Describe structures: dots, globules, or haze. Say clear if none",
+            #     "Colors": "answer en What colors are in this lesion?"
+            # }
+
+            # MedGemma format — direct clinical questions
             obs_queries = {
-                "Architecture": "Is this lesion symmetric or asymmetric?",
-                "Network": "Does it have a pigment network? Answer Yes or No.",
-                "Structures": "Describe structures like dots or haze. Say 'clear' if none.",
-                "Colors": "What specific colors are in this lesion? (e.g. brown, black, white)"
+                "Architecture": "What is the shape of this lesion? Answer with one word: round, oval, or irregular.",
+                "Network": "Does this lesion have a pigment network? Answer with one word: yes or no.",
+                "Structures": "What structures are visible in this lesion? Answer briefly: dots, globules, streaks, or none.",
+                "Colors": "What colors are present in this lesion? Reply with only color names separated by commas, nothing else."
             }
 
+            vlm.reset()  # Flush KV cache before querying new image
             for key, q in obs_queries.items():
-                # Including the filename in the prompt makes the context unique
-                prompt = f"IMAGE_REF: {filename}\nUSER: [img-0]\n{q}\nASSISTANT: Based on pixels, the"
-                
-                res = vlm.create_completion(
-                    prompt=prompt, 
-                    max_tokens=32, 
-                    temperature=0.7,   # Non-zero temp allows for variability
-                    repeat_penalty=1.5, # HIGH penalty stops the "red/blue" loop
-                    seed=current_seed,
-                    stop=["USER:", "IMAGE_REF:"]
+                res = vlm.create_chat_completion(
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_uri}},
+                            {"type": "text", "text": q}
+                        ]
+                    }],
+                    max_tokens=32,
+                    temperature=0.7,
+                    repeat_penalty=1.5,
                 )
-                val = res["choices"][0]["text"].strip().lower()
-                
-                # Cleanup hallucinated prefixes
-                val = val.replace("lesion is", "").replace("evidence shows", "").replace(".", "").strip()
-                
-                if key == "Architecture":
-                    val = "asymmetric" if "asym" in val else "symmetric"
-                raw_obs[key] = val
+                val = res["choices"][0]["message"]["content"].strip().lower()
+                raw_obs[key] = clean_response(val, key)
                 print(f"[BACKEND] Specialist ({key}): {val}")
             
             # HARD RESET: Clean up memory immediately
