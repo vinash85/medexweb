@@ -1,43 +1,46 @@
 import os
-import gc
 import re
 import uuid
-import time
 import base64
+import hashlib
 from PIL import Image, ImageEnhance
 from llama_cpp import Llama
-from llama_cpp.llama_chat_format import register_chat_format, ChatFormatterResponse
+from llama_cpp.llama_chat_format import Llava15ChatHandler
 
-# Raw pass-through handler for PaliGemma base — no chat template wrapping
-@register_chat_format("paligemma-raw")
-def paligemma_raw_handler(messages, **kwargs):
-    prompt = ""
-    for msg in messages:
-        if isinstance(msg["content"], list):
-            for part in msg["content"]:
-                if part["type"] == "text":
-                    prompt += part["text"]
-        elif isinstance(msg["content"], str):
-            prompt += msg["content"]
-    return ChatFormatterResponse(prompt=prompt + "\n")
-
-# --- MedGemma direct-answer handler (bypasses thinking mode) ---
-@register_chat_format("medgemma-direct")
-def medgemma_direct_handler(messages, **kwargs):
-    prompt = ""
-    for msg in messages:
-        role = msg.get("role", "user")
-        prompt += f"<start_of_turn>{role}\n"
-        if isinstance(msg["content"], list):
-            for part in msg["content"]:
-                if part["type"] == "text":
-                    prompt += part["text"]
-        elif isinstance(msg["content"], str):
-            prompt += msg["content"]
-        prompt += "<end_of_turn>\n"
-    # Force model to start with "Answer:" to skip thinking mode
-    prompt += "<start_of_turn>model\nAnswer:"
-    return ChatFormatterResponse(prompt=prompt)
+# --- MedGemma vision handler — subclasses Llava15 for proper CLIP embedding injection ---
+class MedGemmaChatHandler(Llava15ChatHandler):
+    # Gemma 3 turn-based template; image URLs are rendered into text then
+    # replaced with mtmd media markers by the parent __call__.
+    DEFAULT_SYSTEM_MESSAGE = None
+    CHAT_FORMAT = (
+        "{% for message in messages %}"
+        "{% if message.role == 'user' %}"
+        "<start_of_turn>user\n"
+        "{% if message.content is string %}"
+        "{{ message.content }}"
+        "{% else %}"
+        "{% for content in message.content %}"
+        "{% if content.type == 'image_url' and content.image_url is string %}"
+        "{{ content.image_url }}"
+        "{% elif content.type == 'image_url' and content.image_url is mapping %}"
+        "{{ content.image_url.url }}"
+        "{% elif content.type == 'text' %}"
+        "{{ content.text }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% endif %}"
+        "<end_of_turn>\n"
+        "{% endif %}"
+        "{% if message.role == 'assistant' and message.content is not none %}"
+        "<start_of_turn>model\n"
+        "{{ message.content }}<end_of_turn>\n"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "<start_of_turn>model\n"
+        "Answer:"
+        "{% endif %}"
+    )
 
 # --- CONFIGURATION ---
 MODEL_DIR = "/home/project/models"
@@ -47,7 +50,7 @@ SPECIALIST_PATH = os.path.join(MODEL_DIR, "medgemma.gguf")
 SPECIALIST_PROJ = os.path.join(MODEL_DIR, "medgemma-mmproj.gguf")
 MEDGEMMA_PATH = os.path.join(MODEL_DIR, "medgemma.gguf")
 
-# MedGemma format — direct clinical questions
+# MedGemma format — direct clinical questions (one per CLIP call)
 OBS_QUERIES = {
     "Architecture": "What is the shape of this lesion? Answer with one word: round, oval, or irregular.",
     "Network": "Does this lesion have a pigment network? Answer with one word: yes or no.",
@@ -170,8 +173,8 @@ def clean_phase2_output(adj_desc):
 def run_specialist_queries(vlm, image_uri):
     """Run Phase 1 specialist queries on a single image and return cleaned observations."""
     raw_obs = {}
-    vlm.reset()
     for key, q in OBS_QUERIES.items():
+        vlm.reset()
         res = vlm.create_chat_completion(
             messages=[{
                 "role": "user",
@@ -209,8 +212,12 @@ def run_phase2_description(vlm, phase2_inputs):
     return res["choices"][0]["message"]["content"].strip()
 
 
-def run_phase3_classification(text_model, phase3_inputs):
-    """Run Phase 3: rule-based MEL/BCC/BKL + LLM fallback."""
+def run_phase3_classification(vlm, phase3_inputs):
+    """Run Phase 3: rule-based MEL/BCC/BKL + LLM fallback.
+
+    Uses the same vision model for text-only prompts — the handler template
+    handles `message.content is string` correctly (no CLIP processing).
+    """
     raw_obs = phase3_inputs.get("raw_obs", {})
     arch = raw_obs.get("Architecture", "").lower()
     net = raw_obs.get("Network", "").lower()
@@ -230,8 +237,8 @@ def run_phase3_classification(text_model, phase3_inputs):
         return "MEL", f"RULE:{reason}"
 
     # Ask LLM for BCC/BKL detection from clinical description (fallback)
-    text_model.reset()
-    res = text_model.create_chat_completion(
+    vlm.reset()
+    res = vlm.create_chat_completion(
         messages=[{
             "role": "user",
             "content": phase3_inputs["prompt"],
@@ -250,10 +257,26 @@ def run_phase3_classification(text_model, phase3_inputs):
 
 
 class DermPipeline:
+    def __init__(self):
+        """Load the vision model once — reused across all images and phases."""
+        print("[BACKEND] Loading MedGemma vision model (one-time)...")
+        self._handler = MedGemmaChatHandler(clip_model_path=SPECIALIST_PROJ, verbose=False)
+        self._vlm = Llama(
+            model_path=SPECIALIST_PATH,
+            n_ctx=2048,
+            n_gpu_layers=-1,
+            chat_handler=self._handler,
+            verbose=False
+        )
+        print("[BACKEND] MedGemma vision model loaded and ready.")
+
     def _encode_image_base64(self, image_path: str) -> str:
         """Read image file and return a data URI for llama-cpp-python chat API."""
         with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
+            raw = f.read()
+        md5 = hashlib.md5(raw).hexdigest()
+        print(f"[BACKEND] Image encoded: path={image_path}, size={len(raw)} bytes, md5={md5}")
+        b64 = base64.b64encode(raw).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
 
     def prepare_phase2_inputs(self, raw_obs, image_uri):
@@ -321,68 +344,31 @@ class DermPipeline:
     def process(self, filename: str):
         processed_path = self._prepare_image(filename)
         print(f"\n[BACKEND] >>> STARTING FRESH ANALYSIS: {filename}")
-        
+
         try:
-            # PHASE 1: Specialist (The Vision Model - MedGemma multimodal)
-            # Re-initializing here is heavy, but essential to clear internal KV-cache
-            vlm = Llama(
-                model_path=SPECIALIST_PATH,
-                clip_model_path=SPECIALIST_PROJ,
-                n_ctx=2048,
-                n_gpu_layers=-1,
-                chat_format="medgemma-direct",
-                verbose=False
-            )
-            
             # Encode the processed image as base64 data URI for the chat API
             image_uri = self._encode_image_base64(processed_path)
-            raw_obs = run_specialist_queries(vlm, image_uri)
-            
-            # HARD RESET: Clean up memory immediately
-            vlm.reset()
-            del vlm
-            gc.collect()
-            time.sleep(0.5) # Brief pause for GPU VRAM deallocation
 
-            # STAGING: Prepare input triplet for future visual Phase 2
+            # PHASE 1: Combined specialist observations (single CLIP-encoded call)
+            raw_obs = run_specialist_queries(self._vlm, image_uri)
+
+            # STAGING: Prepare input triplet for Phase 2
             phase2_inputs = self.prepare_phase2_inputs(raw_obs, image_uri)
             print(f"[BACKEND] Staged Phase 2 inputs: context={len(phase2_inputs['context'])} chars, "
                   f"prompt={len(phase2_inputs['prompt'])} chars, "
                   f"image_uri={'valid' if phase2_inputs['image_uri'].startswith('data:image/') else 'INVALID'}")
 
-            # PHASE 2: Visual MedGemma (description generation)
-            reasoner = Llama(
-                model_path=MEDGEMMA_PATH,
-                clip_model_path=SPECIALIST_PROJ,
-                n_ctx=2048,
-                n_gpu_layers=-1,
-                chat_format="medgemma-direct",
-                verbose=False
-            )
-            adj_desc = run_phase2_description(reasoner, phase2_inputs)
+            # PHASE 2: Visual MedGemma description (reuse same model)
+            adj_desc = run_phase2_description(self._vlm, phase2_inputs)
             print(f"[BACKEND] Phase 2 Description: {adj_desc}")
-
-            del reasoner
-            gc.collect()
-            time.sleep(0.5)
 
             # STAGING: Prepare Phase 3 inputs (cleans Phase 2 output)
             phase3_inputs = self.prepare_phase3_inputs(raw_obs, adj_desc)
             print(f"[BACKEND] Staged Phase 3 inputs: cleaned_desc={len(phase3_inputs['cleaned_description'])} chars")
 
-            # PHASE 3: Text-only MedGemma classification (no CLIP projector)
-            text_model = Llama(
-                model_path=MEDGEMMA_PATH,
-                n_ctx=2048,
-                n_gpu_layers=-1,
-                chat_format="medgemma-direct",
-                verbose=False,
-            )
-            code, raw_class = run_phase3_classification(text_model, phase3_inputs)
+            # PHASE 3: Classification (reuse vision model for text-only prompt)
+            code, raw_class = run_phase3_classification(self._vlm, phase3_inputs)
             print(f"[BACKEND] Phase 3 Classification: {code} (raw: {raw_class})")
-
-            del text_model
-            gc.collect()
 
             report = (
                 f"--- DERMATOLOGY AI ADJUDICATION ---\n"
@@ -399,7 +385,7 @@ class DermPipeline:
                 "raw_obs": raw_obs,
                 "final_implication": report,
             }
-            
+
         finally:
             if os.path.exists(processed_path):
                 os.remove(processed_path)
