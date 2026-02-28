@@ -1,7 +1,8 @@
 """
-Phase 2 Visual Test — Visual MedGemma description generation
+Phase 2 Visual Test — Visual MedGemma comparison review
 Runs Phase 1 specialist queries, stages the triplet, then sends image + context + prompt
-to visual MedGemma for clinical description generation.
+to visual MedGemma which compares specialist observations against the image and
+identifies any additional findings the specialist may have missed.
 
 Run inside Docker:
     python3 /home/project/code/test_phase2.py
@@ -24,9 +25,20 @@ REFUSAL_PHRASES = ["i cannot", "i'm sorry", "as an ai", "not able to", "inapprop
 SPECIAL_TOKENS = ["<start_of_turn>", "<end_of_turn>", "<eos>", "<pad>", "\u2581"]
 THINKING_MARKERS = ["<think>", "<reasoning>", "<thought>"]
 
+# Keywords that indicate the model is actually comparing observations
+COMPARISON_KEYWORDS = ["agree", "disagree", "consistent", "inconsistent",
+                       "confirm", "correct", "incorrect", "match", "contrast",
+                       "however", "additionally", "also note", "missed",
+                       "not mentioned", "overlooked", "furthermore"]
+
+# Keywords for additional clinical findings beyond specialist observations
+ADDITIONAL_FINDING_KEYWORDS = ["asymmetry", "border", "regression", "vascular",
+                               "ulceration", "blotch", "veil", "atypical",
+                               "irregular", "pattern", "dermoscopic"]
+
 
 def check_flags(adj_desc):
-    """Run validation checks on a Phase 2 description. Returns list of flag strings."""
+    """Run validation checks on a Phase 2 comparison review. Returns list of flag strings."""
     flags = []
     lower = adj_desc.lower()
 
@@ -35,13 +47,14 @@ def check_flags(adj_desc):
         flags.append("empty")
         return flags
 
-    # 2. Meaningful length
-    if len(adj_desc) < 10:
+    # 2. Meaningful length — comparison output should be longer than a single sentence
+    if len(adj_desc) < 30:
         flags.append("too_short")
 
-    # 3. Classification leakage
+    # 3. Classification leakage — only flag standalone codes, not medical terms
+    #    e.g. flag "CODE: MEL" but not "melanoma" or "amelanotic"
     for code in CLASSIFICATION_CODES:
-        if code in adj_desc.upper():
+        if re.search(r'\b' + code + r'\b', adj_desc.upper()):
             flags.append("classification_leakage")
             break
 
@@ -84,6 +97,16 @@ def check_flags(adj_desc):
             flags.append("thinking_leak")
             break
 
+    # 7. Comparison content check — output should reference specialist observations
+    has_comparison = any(kw in lower for kw in COMPARISON_KEYWORDS)
+    if not has_comparison:
+        flags.append("no_comparison")
+
+    # 8. Additional findings check — should mention findings beyond specialist input
+    has_additional = any(kw in lower for kw in ADDITIONAL_FINDING_KEYWORDS)
+    if not has_additional:
+        flags.append("no_additional_findings")
+
     return flags
 
 
@@ -98,7 +121,7 @@ def run_phase2_test():
         sys.exit(1)
 
     print("=" * 70)
-    print(f"PHASE 2 VISUAL TEST — {total} images")
+    print(f"PHASE 2 COMPARISON REVIEW TEST — {total} images")
     print(f"Model: {SPECIALIST_PATH}")
     print(f"Projector: {SPECIALIST_PROJ}")
     print("=" * 70)
@@ -126,6 +149,8 @@ def run_phase2_test():
     errors = 0
     guardrail_hits = 0
     gibberish_hits = 0
+    no_comparison_hits = 0
+    no_additional_hits = 0
     clean_count = 0
 
     for img_idx, img_file in enumerate(all_images, 1):
@@ -173,11 +198,17 @@ def run_phase2_test():
             "gibberish_repeat", "special_token_leak", "excessive_non_ascii", "low_alpha_ratio"
         ])
         has_thinking = "thinking_leak" in flags
+        has_no_comparison = "no_comparison" in flags
+        has_no_additional = "no_additional_findings" in flags
 
         if has_guardrail:
             guardrail_hits += 1
         if has_gibberish:
             gibberish_hits += 1
+        if has_no_comparison:
+            no_comparison_hits += 1
+        if has_no_additional:
+            no_additional_hits += 1
 
         if flags:
             print(f"  FLAGS: {flag_str}")
@@ -189,6 +220,12 @@ def run_phase2_test():
                 print(f"  [GIBBERISH] Prompt sent: {phase2_inputs['prompt'][:200]}...")
             if has_thinking:
                 print(f"  [THINKING LEAK] Full output: {adj_desc}")
+            if has_no_comparison:
+                print(f"  [NO COMPARISON] Output lacks specialist comparison language")
+                print(f"  [NO COMPARISON] Full output: {adj_desc[:300]}...")
+            if has_no_additional:
+                print(f"  [NO ADDITIONAL] Output lacks additional clinical findings")
+                print(f"  [NO ADDITIONAL] Full output: {adj_desc[:300]}...")
             if any(f in flags for f in ["empty", "too_short", "classification_leakage"]):
                 print(f"  [DIAGNOSTIC] Full output: '{adj_desc}'")
                 print(f"  [DIAGNOSTIC] raw_obs: {raw_obs}")
@@ -218,7 +255,7 @@ def run_phase2_test():
 
     # --- SUMMARY TABLE ---
     print("\n" + "=" * 70)
-    print("PHASE 2 SUMMARY TABLE")
+    print("PHASE 2 COMPARISON REVIEW SUMMARY")
     print("=" * 70)
     print(f"{'Image':<22s} {'Arch':<12s} {'Net':<6s} {'Struct':<15s} {'Colors':<15s} {'Len':>4s} {'Flags':<20s} Description")
     print("-" * 130)
@@ -232,13 +269,15 @@ def run_phase2_test():
     print("\n" + "=" * 70)
     print("TOTALS")
     print("=" * 70)
-    print(f"  Images processed: {len(all_results)}")
-    print(f"  Errors:           {errors}")
-    print(f"  Clean outputs:    {clean_count}")
-    print(f"  Guardrail hits:   {guardrail_hits}")
-    print(f"  Gibberish hits:   {gibberish_hits}")
+    print(f"  Images processed:    {len(all_results)}")
+    print(f"  Errors:              {errors}")
+    print(f"  Clean outputs:       {clean_count}")
+    print(f"  Guardrail hits:      {guardrail_hits}")
+    print(f"  Gibberish hits:      {gibberish_hits}")
+    print(f"  No comparison:       {no_comparison_hits}")
+    print(f"  No additional finds: {no_additional_hits}")
     if len(all_results) > 0:
-        print(f"  Clean rate:       {100 * clean_count / len(all_results):.1f}%")
+        print(f"  Clean rate:          {100 * clean_count / len(all_results):.1f}%")
 
     # --- CSV OUTPUT ---
     out_path = "/home/project/data/phase2_results.csv"

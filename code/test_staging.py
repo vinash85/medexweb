@@ -104,11 +104,11 @@ def run_staging_test():
         if not uri_valid:
             issues.append("image_uri not a valid data URI")
 
-        # 3. Prompt includes context + clinical description request
+        # 3. Prompt includes context + comparison review request
         if phase2["context"] not in phase2["prompt"]:
             issues.append("prompt does not include context")
-        if "clinical description" not in phase2["prompt"].lower():
-            issues.append("prompt missing clinical description request")
+        if "compare" not in phase2["prompt"].lower():
+            issues.append("prompt missing comparison request")
 
         # 4. raw_obs has all 4 keys with non-empty values
         for attr in EXPECTED_KEYS:
