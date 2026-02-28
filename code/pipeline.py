@@ -4,38 +4,56 @@ import re
 import uuid
 import time
 import base64
+import hashlib
 from PIL import Image, ImageEnhance
 from llama_cpp import Llama
-from llama_cpp.llama_chat_format import register_chat_format, ChatFormatterResponse
+from llama_cpp.llama_chat_format import register_chat_format, ChatFormatterResponse, Llava15ChatHandler
 
-# Raw pass-through handler for PaliGemma base — no chat template wrapping
-@register_chat_format("paligemma-raw")
-def paligemma_raw_handler(messages, **kwargs):
-    prompt = ""
-    for msg in messages:
-        if isinstance(msg["content"], list):
-            for part in msg["content"]:
-                if part["type"] == "text":
-                    prompt += part["text"]
-        elif isinstance(msg["content"], str):
-            prompt += msg["content"]
-    return ChatFormatterResponse(prompt=prompt + "\n")
+# --- MedGemma vision handler — subclasses Llava15 for proper CLIP embedding injection ---
+class MedGemmaChatHandler(Llava15ChatHandler):
+    # Gemma 3 turn-based template; image URLs are rendered into text then
+    # replaced with mtmd media markers by the parent __call__.
+    DEFAULT_SYSTEM_MESSAGE = None
+    CHAT_FORMAT = (
+        "{% for message in messages %}"
+        "{% if message.role == 'user' %}"
+        "<start_of_turn>user\n"
+        "{% if message.content is string %}"
+        "{{ message.content }}"
+        "{% else %}"
+        "{% for content in message.content %}"
+        "{% if content.type == 'image_url' and content.image_url is string %}"
+        "{{ content.image_url }}"
+        "{% elif content.type == 'image_url' and content.image_url is mapping %}"
+        "{{ content.image_url.url }}"
+        "{% elif content.type == 'text' %}"
+        "{{ content.text }}"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% endif %}"
+        "<end_of_turn>\n"
+        "{% endif %}"
+        "{% if message.role == 'assistant' and message.content is not none %}"
+        "<start_of_turn>model\n"
+        "{{ message.content }}<end_of_turn>\n"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "<start_of_turn>model\n"
+        "Answer:"
+        "{% endif %}"
+    )
 
-# --- MedGemma direct-answer handler (bypasses thinking mode) ---
+# --- MedGemma text-only handler (for Phase 3 — no images) ---
 @register_chat_format("medgemma-direct")
 def medgemma_direct_handler(messages, **kwargs):
     prompt = ""
     for msg in messages:
         role = msg.get("role", "user")
         prompt += f"<start_of_turn>{role}\n"
-        if isinstance(msg["content"], list):
-            for part in msg["content"]:
-                if part["type"] == "text":
-                    prompt += part["text"]
-        elif isinstance(msg["content"], str):
+        if isinstance(msg["content"], str):
             prompt += msg["content"]
         prompt += "<end_of_turn>\n"
-    # Force model to start with "Answer:" to skip thinking mode
     prompt += "<start_of_turn>model\nAnswer:"
     return ChatFormatterResponse(prompt=prompt)
 
@@ -253,7 +271,10 @@ class DermPipeline:
     def _encode_image_base64(self, image_path: str) -> str:
         """Read image file and return a data URI for llama-cpp-python chat API."""
         with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
+            raw = f.read()
+        md5 = hashlib.md5(raw).hexdigest()
+        print(f"[BACKEND] Image encoded: path={image_path}, size={len(raw)} bytes, md5={md5}")
+        b64 = base64.b64encode(raw).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
 
     def prepare_phase2_inputs(self, raw_obs, image_uri):
@@ -324,23 +345,24 @@ class DermPipeline:
         
         try:
             # PHASE 1: Specialist (The Vision Model - MedGemma multimodal)
-            # Re-initializing here is heavy, but essential to clear internal KV-cache
+            # chat_handler (not chat_format) is required for actual CLIP embedding injection
+            handler1 = MedGemmaChatHandler(clip_model_path=SPECIALIST_PROJ, verbose=False)
             vlm = Llama(
                 model_path=SPECIALIST_PATH,
-                clip_model_path=SPECIALIST_PROJ,
                 n_ctx=2048,
                 n_gpu_layers=-1,
-                chat_format="medgemma-direct",
+                chat_handler=handler1,
                 verbose=False
             )
-            
+
             # Encode the processed image as base64 data URI for the chat API
             image_uri = self._encode_image_base64(processed_path)
             raw_obs = run_specialist_queries(vlm, image_uri)
-            
+
             # HARD RESET: Clean up memory immediately
             vlm.reset()
             del vlm
+            del handler1
             gc.collect()
             time.sleep(0.5) # Brief pause for GPU VRAM deallocation
 
@@ -351,18 +373,19 @@ class DermPipeline:
                   f"image_uri={'valid' if phase2_inputs['image_uri'].startswith('data:image/') else 'INVALID'}")
 
             # PHASE 2: Visual MedGemma (description generation)
+            handler2 = MedGemmaChatHandler(clip_model_path=SPECIALIST_PROJ, verbose=False)
             reasoner = Llama(
                 model_path=MEDGEMMA_PATH,
-                clip_model_path=SPECIALIST_PROJ,
                 n_ctx=2048,
                 n_gpu_layers=-1,
-                chat_format="medgemma-direct",
+                chat_handler=handler2,
                 verbose=False
             )
             adj_desc = run_phase2_description(reasoner, phase2_inputs)
             print(f"[BACKEND] Phase 2 Description: {adj_desc}")
 
             del reasoner
+            del handler2
             gc.collect()
             time.sleep(0.5)
 

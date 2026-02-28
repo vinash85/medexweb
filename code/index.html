@@ -1,87 +1,383 @@
 <!DOCTYPE html>
 <html>
-<head><title>DermatoAI Adjudicator</title></head>
-<body style="font-family:sans-serif; background:#f0f2f5; padding:20px;">
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; max-width:1150px; margin:auto;">
-        <div style="background:white; padding:25px; border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.1);">
-            <h3 id="stat" style="margin-top:0;">Initializing...</h3>
-            <div style="background:black; height:450px; display:flex; align-items:center; justify-content:center; border-radius:10px; overflow:hidden;">
-                <img id="img" src="" style="max-width:100%; max-height:100%;">
-            </div>
-            <p style="margin-top:15px;"><strong>Target File:</strong> <span id="filename">--</span></p>
-        </div>
+<head>
+<title>DermatoAI Adjudicator</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f2f5; }
 
-        <div style="background:white; padding:25px; border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.1);">
-            <div style="display:flex; justify-content:space-between; background:#e9ecef; padding:15px; border-radius:8px; font-weight:bold; font-size:1.2em;">
-                <span>AI CODE: <span id="ai" style="color:#007bff;">--</span></span>
-                <span>GT CODE: <span id="gt" style="color:#dc3545;">--</span></span>
-            </div>
-            <pre id="console" style="background:#1e1e1e; color:#4ade80; padding:20px; height:380px; overflow-y:auto; white-space:pre-wrap; border-radius:8px; margin-top:15px; font-family:monospace; font-size:13px; border:1px solid #333;">System ready. Click below to analyze image.</pre>
-            <button id="btn" onclick="run()" style="width:100%; padding:20px; background:#007bff; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:bold; margin-top:15px; font-size:1.1em;">RUN ADJUDICATION PIPELINE</button>
-        </div>
+  .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 0; max-width: 1400px; margin: 0 auto; height: 100vh; }
+
+  /* Left column — image panel */
+  .left-panel {
+    position: sticky; top: 0; height: 100vh; overflow: hidden;
+    background: #1a1a2e; display: flex; flex-direction: column; padding: 20px;
+  }
+  .exam-header { color: #8b8fa3; font-size: 13px; margin-bottom: 8px; }
+  .exam-header strong { color: #fff; font-size: 15px; }
+  .image-box {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    background: #000; border-radius: 10px; overflow: hidden; min-height: 0;
+  }
+  .image-box img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .filename-bar {
+    margin-top: 12px; padding: 10px 14px; background: rgba(255,255,255,0.07);
+    border-radius: 8px; color: #a0a4b8; font-family: monospace; font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .nav-buttons { display: flex; gap: 10px; margin-top: 12px; }
+  .nav-buttons button {
+    flex: 1; padding: 12px; border: none; border-radius: 8px; cursor: pointer;
+    font-weight: 600; font-size: 14px; transition: background 0.15s;
+  }
+  .btn-prev { background: #2d2d44; color: #a0a4b8; }
+  .btn-prev:hover:not(:disabled) { background: #3d3d5c; }
+  .btn-prev:disabled { opacity: 0.3; cursor: default; }
+  .btn-next { background: #00b894; color: #fff; }
+  .btn-next:hover:not(:disabled) { background: #00a381; }
+  .btn-next:disabled { opacity: 0.3; cursor: default; }
+
+  /* Right column — results panel */
+  .right-panel { overflow-y: auto; height: 100vh; padding: 20px; }
+
+  .code-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 16px 20px; border-radius: 10px; font-weight: 700; font-size: 1.15em;
+    margin-bottom: 16px;
+  }
+  .code-match { background: #d4edda; border: 2px solid #28a745; }
+  .code-mismatch { background: #f8d7da; border: 2px solid #dc3545; }
+  .code-neutral { background: #e9ecef; border: 2px solid #6c757d; }
+  .code-bar .ai-code { color: #007bff; }
+  .code-bar .gt-code { color: #dc3545; }
+
+  .run-btn {
+    width: 100%; padding: 18px; background: #007bff; color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; font-weight: 700; font-size: 1.1em;
+    margin-bottom: 16px; transition: background 0.15s;
+  }
+  .run-btn:hover:not(:disabled) { background: #0056b3; }
+  .run-btn:disabled { background: #6c757d; cursor: default; }
+
+  .spinner {
+    display: none; text-align: center; padding: 40px; color: #6c757d;
+  }
+  .spinner.active { display: block; }
+  .spinner .dots::after { content: ''; animation: dots 1.5s steps(4, end) infinite; }
+  @keyframes dots {
+    0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; }
+  }
+
+  /* Phase sections */
+  .phase-section {
+    background: #fff; border-radius: 10px; margin-bottom: 14px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06); overflow: hidden;
+  }
+  .phase-header {
+    padding: 14px 18px; font-weight: 700; font-size: 14px; cursor: pointer;
+    display: flex; justify-content: space-between; align-items: center;
+    user-select: none;
+  }
+  .phase-header .arrow { transition: transform 0.2s; font-size: 12px; color: #888; }
+  .phase-header.collapsed .arrow { transform: rotate(-90deg); }
+  .phase-body { padding: 0 18px 16px; }
+  .phase-header.collapsed + .phase-body { display: none; }
+
+  .phase1-header { background: #e8f4fd; color: #0c5460; }
+  .phase2-header { background: #fff3cd; color: #856404; }
+  .phase3-header { background: #d4edda; color: #155724; }
+  .gt-header { background: #f8d7da; color: #721c24; }
+
+  /* Phase 1 table */
+  .obs-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .obs-table td { padding: 8px 10px; border-bottom: 1px solid #f0f0f0; }
+  .obs-table td:first-child { font-weight: 600; color: #555; width: 35%; white-space: nowrap; }
+  .obs-table td:last-child { color: #222; }
+
+  /* Phase 2 text */
+  .phase2-text { font-size: 14px; line-height: 1.65; color: #333; }
+
+  /* Phase 3 report */
+  .phase3-report {
+    background: #1e1e1e; color: #4ade80; padding: 16px; border-radius: 8px;
+    font-family: monospace; font-size: 13px; white-space: pre-wrap;
+    max-height: 400px; overflow-y: auto; line-height: 1.5;
+  }
+
+  .gt-text { font-size: 14px; line-height: 1.6; color: #333; }
+
+  .results-container { display: none; }
+  .results-container.visible { display: block; }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- LEFT: Image Panel -->
+  <div class="left-panel">
+    <div class="exam-header">
+      <span id="stat">Initializing...</span>
+    </div>
+    <div class="image-box">
+      <img id="img" src="" alt="Dermoscopy image">
+    </div>
+    <div class="filename-bar" id="filename">--</div>
+    <div class="nav-buttons">
+      <button class="btn-prev" id="btnPrev" onclick="navigate(-1)" disabled>&larr; PREVIOUS</button>
+      <button class="btn-next" id="btnNext" onclick="navigate(1)" disabled>NEXT IMAGE &rarr;</button>
+    </div>
+  </div>
+
+  <!-- RIGHT: Results Panel -->
+  <div class="right-panel">
+
+    <div class="code-bar code-neutral" id="codeBar">
+      <span>AI CODE: <span class="ai-code" id="ai">--</span></span>
+      <span>GT CODE: <span class="gt-code" id="gt">--</span></span>
     </div>
 
-    <script>
-        let queue = [], idx = 0;
+    <button class="run-btn" id="btn" onclick="run()">RUN ADJUDICATION PIPELINE</button>
 
-        async function init() {
-            try {
-                const res = await fetch('/api/list-images');
-                queue = await res.json();
-                if(queue.length > 0) updateDisplay();
-            } catch (e) { document.getElementById('stat').innerText = "Connection Error"; }
-        }
+    <div class="spinner" id="spinner">
+      <div style="font-size:32px; margin-bottom:12px;">&#128300;</div>
+      <div style="font-weight:600;">Analyzing dermoscopy image<span class="dots"></span></div>
+      <div style="font-size:13px; margin-top:8px; color:#999;">This may take 30-120 seconds</div>
+      <div id="elapsed" style="font-size:13px; margin-top:6px; color:#aaa; font-family:monospace;">0s elapsed</div>
+    </div>
 
-        function updateDisplay() {
-            const currentFile = queue[idx];
-            document.getElementById('stat').innerText = `Examination: ${idx + 1} of ${queue.length}`;
-            document.getElementById('filename').innerText = currentFile;
-            document.getElementById('img').src = `/images/${currentFile}`;
-            document.getElementById('ai').innerText = "--";
-            document.getElementById('gt').innerText = "--";
-        }
+    <div class="results-container" id="results">
 
-        async function run() {
-            if(idx >= queue.length) return;
-            const btn = document.getElementById('btn');
-            const con = document.getElementById('console');
-            const target = queue[idx];
+      <!-- Phase 1 -->
+      <div class="phase-section">
+        <div class="phase-header phase1-header" onclick="toggleSection(this)">
+          <span>Phase 1 &mdash; Specialist Observations</span>
+          <span class="arrow">&#9660;</span>
+        </div>
+        <div class="phase-body">
+          <table class="obs-table" id="obsTable"><tbody></tbody></table>
+        </div>
+      </div>
 
-            btn.disabled = true;
-            con.innerText = `>>> [ACTION] ANALYZING: ${target}\n>>> [STEP 1] Loading specialist.gguf...\n>>> [STEP 2] Running 4-Point visual inspection...`;
+      <!-- Phase 2 -->
+      <div class="phase-section">
+        <div class="phase-header phase2-header" onclick="toggleSection(this)">
+          <span>Phase 2 &mdash; Clinical Description</span>
+          <span class="arrow">&#9660;</span>
+        </div>
+        <div class="phase-body">
+          <div class="phase2-text" id="adjDesc">--</div>
+        </div>
+      </div>
 
-            try {
-                const response = await fetch('/api/analyze', {
-                    method:'POST', 
-                    headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({filename: target})
-                });
-                const data = await response.json();
+      <!-- Phase 3 -->
+      <div class="phase-section">
+        <div class="phase-header phase3-header" onclick="toggleSection(this)">
+          <span>Phase 3 &mdash; Classification &amp; Report</span>
+          <span class="arrow">&#9660;</span>
+        </div>
+        <div class="phase-body">
+          <pre class="phase3-report" id="finalReport">--</pre>
+        </div>
+      </div>
 
-                // Show report for the current image
-                document.getElementById('ai').innerText = data.ai_code;
-                document.getElementById('gt').innerText = data.gt_code;
-                con.innerText = data.final_implication;
+      <!-- Ground Truth -->
+      <div class="phase-section">
+        <div class="phase-header gt-header" onclick="toggleSection(this)">
+          <span>Ground Truth</span>
+          <span class="arrow">&#9660;</span>
+        </div>
+        <div class="phase-body">
+          <div class="gt-text" id="gtAttr">--</div>
+        </div>
+      </div>
 
-                // Move to next image after a brief delay
-                setTimeout(() => {
-                    idx++;
-                    if(idx < queue.length) {
-                        updateDisplay();
-                        con.innerText += `\n\n--- COMPLETED ---\nNext target loaded.`;
-                    } else {
-                        document.getElementById('stat').innerText = "Queue Complete";
-                        con.innerText += `\n\n--- ALL TARGETS PROCESSED ---`;
-                    }
-                    btn.disabled = false;
-                }, 800);
+    </div>
+  </div>
+</div>
 
-            } catch (e) {
-                con.innerText = "CRITICAL ERROR: " + e;
-                btn.disabled = false;
-            }
-        }
-        init();
-    </script>
+<script>
+let queue = [], idx = 0;
+// Cache analysis results so user can navigate back
+const cache = {};
+
+async function init() {
+  try {
+    const res = await fetch('/api/list-images');
+    queue = await res.json();
+    if (queue.length > 0) updateDisplay();
+    else document.getElementById('stat').innerText = 'No images found';
+  } catch (e) {
+    document.getElementById('stat').innerText = 'Connection Error';
+  }
+}
+
+function updateDisplay() {
+  const file = queue[idx];
+  document.getElementById('stat').innerHTML =
+    '<strong>Examination ' + (idx + 1) + ' of ' + queue.length + '</strong>';
+  document.getElementById('filename').innerText = file;
+  document.getElementById('img').src = '/images/' + file;
+
+  // Reset codes
+  const codeBar = document.getElementById('codeBar');
+  codeBar.className = 'code-bar code-neutral';
+  document.getElementById('ai').innerText = '--';
+  document.getElementById('gt').innerText = '--';
+
+  // Navigation buttons
+  document.getElementById('btnPrev').disabled = (idx === 0);
+  document.getElementById('btnNext').disabled = true; // enabled after analysis
+
+  // If we have cached results for this image, show them
+  if (cache[file]) {
+    showResults(cache[file]);
+    document.getElementById('btn').disabled = false;
+    document.getElementById('btnNext').disabled = (idx >= queue.length - 1);
+  } else {
+    // Hide results, show run button
+    document.getElementById('results').classList.remove('visible');
+    document.getElementById('spinner').classList.remove('active');
+    document.getElementById('btn').disabled = false;
+    document.getElementById('btn').innerText = 'RUN ADJUDICATION PIPELINE';
+  }
+}
+
+function navigate(dir) {
+  const newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= queue.length) return;
+  idx = newIdx;
+  updateDisplay();
+}
+
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+async function run() {
+  if (idx >= queue.length) return;
+  const btn = document.getElementById('btn');
+  const spinner = document.getElementById('spinner');
+  const timerEl = document.getElementById('elapsed');
+  const target = queue[idx];
+
+  btn.disabled = true;
+  btn.innerText = 'ANALYZING...';
+  document.getElementById('results').classList.remove('visible');
+  spinner.classList.add('active');
+
+  // Elapsed time counter
+  var startTime = Date.now();
+  var timerInterval = setInterval(function() {
+    var sec = Math.floor((Date.now() - startTime) / 1000);
+    timerEl.innerText = sec + 's elapsed';
+  }, 1000);
+
+  try {
+    // Step 1: Start the analysis job (returns immediately)
+    var resp = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: target })
+    });
+    if (!resp.ok) throw new Error('Server returned HTTP ' + resp.status);
+    var job = await resp.json();
+    var jobId = job.job_id;
+
+    // Step 2: Poll for results every 3 seconds
+    var data = null;
+    while (true) {
+      await sleep(3000);
+      var pollResp = await fetch('/api/status/' + jobId);
+      if (!pollResp.ok) throw new Error('Poll returned HTTP ' + pollResp.status);
+      var status = await pollResp.json();
+
+      if (status.status === 'done') {
+        data = status.result;
+        break;
+      } else if (status.status === 'error') {
+        throw new Error('Pipeline error: ' + status.error);
+      }
+      // status === 'running' -> keep polling
+    }
+
+    clearInterval(timerInterval);
+    cache[target] = data;
+    spinner.classList.remove('active');
+    showResults(data);
+
+    btn.innerText = 'RUN ADJUDICATION PIPELINE';
+    btn.disabled = false;
+    document.getElementById('btnNext').disabled = (idx >= queue.length - 1);
+
+  } catch (e) {
+    clearInterval(timerInterval);
+    spinner.classList.remove('active');
+    console.error('Analysis error:', e);
+
+    document.getElementById('results').classList.add('visible');
+    document.getElementById('finalReport').innerText = 'ERROR: ' + e.message;
+    btn.innerText = 'RUN ADJUDICATION PIPELINE';
+    btn.disabled = false;
+  }
+}
+
+function showResults(data) {
+  // Code bar
+  document.getElementById('ai').innerText = data.ai_code;
+  document.getElementById('gt').innerText = data.gt_code;
+
+  const codeBar = document.getElementById('codeBar');
+  if (data.ai_code === '--' || data.gt_code === '--') {
+    codeBar.className = 'code-bar code-neutral';
+  } else if (data.ai_code === data.gt_code) {
+    codeBar.className = 'code-bar code-match';
+  } else {
+    codeBar.className = 'code-bar code-mismatch';
+  }
+
+  // Phase 1 — Specialist observations table
+  const tbody = document.getElementById('obsTable').querySelector('tbody');
+  tbody.innerHTML = '';
+  const obs = data.raw_obs || {};
+  const labels = {
+    Architecture: 'Shape / Architecture',
+    Network: 'Pigment Network',
+    Structures: 'Structures',
+    Colors: 'Colors',
+    Vessels: 'Vessels',
+    Regression: 'Regression / Blue-white Veil',
+    Keratosis: 'Comedo-like / Milia-like Cysts'
+  };
+  for (const [key, label] of Object.entries(labels)) {
+    if (obs[key] !== undefined) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + label + '</td><td>' + escapeHtml(obs[key]) + '</td>';
+      tbody.appendChild(tr);
+    }
+  }
+
+  // Phase 2 — Clinical description
+  document.getElementById('adjDesc').innerText = data.adj_desc || 'N/A';
+
+  // Phase 3 — Full report
+  document.getElementById('finalReport').innerText = data.final_implication || 'N/A';
+
+  // Ground truth
+  document.getElementById('gtAttr').innerText =
+    'Diagnosis: ' + data.gt_code + '\nLesion attributes: ' + (data.gt_attr || 'N/A');
+
+  document.getElementById('results').classList.add('visible');
+}
+
+function toggleSection(header) {
+  header.classList.toggle('collapsed');
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+init();
+</script>
 </body>
 </html>

@@ -2,6 +2,7 @@ services:
   derm-mcp:
     build: .
     image: derm-mcp
+    container_name: medex-derm
     deploy:
       resources:
         reservations:
@@ -10,5 +11,11 @@ services:
               count: 1
               capabilities: [gpu]
     volumes:
-      - ./models:/models
-      - ./data:/data
+      - ../code:/home/project/code
+      - ../models:/home/project/models
+      - ../data:/home/project/data
+    ports:
+      - "6565:6565"
+    working_dir: /home/project/code
+    command: python3 server.py
+    restart: unless-stopped
