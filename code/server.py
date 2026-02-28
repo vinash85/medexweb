@@ -9,6 +9,16 @@ app = Flask(__name__)
 db = {"meta": {}}
 jobs = {}  # job_id -> {"status": "running"|"done"|"error", "result": ...}
 
+# Singleton pipeline — model loaded once, reused across all requests
+_pipeline = None
+_pipeline_lock = threading.Lock()
+
+def get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = DermPipeline()
+    return _pipeline
+
 def load_data():
     df = pd.read_csv("DermsGemms.csv", skipinitialspace=True)
     df.columns = [c.strip() for c in df.columns]
@@ -19,9 +29,13 @@ def load_data():
 load_data()
 
 def _run_analysis(job_id, fname):
-    """Run pipeline in background thread, store result in jobs dict."""
+    """Run pipeline in background thread, store result in jobs dict.
+
+    Lock serializes GPU access — only one analysis at a time.
+    """
     try:
-        res = DermPipeline().process(fname)
+        with _pipeline_lock:
+            res = get_pipeline().process(fname)
         rec = db["meta"].get(os.path.splitext(fname)[0], {})
         jobs[job_id] = {
             "status": "done",
