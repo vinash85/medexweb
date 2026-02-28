@@ -48,6 +48,14 @@ SPECIALIST_PATH = os.path.join(MODEL_DIR, "medgemma.gguf")
 SPECIALIST_PROJ = os.path.join(MODEL_DIR, "medgemma-mmproj.gguf")
 MEDGEMMA_PATH = os.path.join(MODEL_DIR, "medgemma.gguf")
 
+# MedGemma format — direct clinical questions
+OBS_QUERIES = {
+    "Architecture": "What is the shape of this lesion? Answer with one word: round, oval, or irregular.",
+    "Network": "Does this lesion have a pigment network? Answer with one word: yes or no.",
+    "Structures": "What structures are visible in this lesion? Answer briefly: dots, globules, streaks, or none.",
+    "Colors": "What colors are present in this lesion? Reply with only color names separated by commas, nothing else.",
+}
+
 def clean_response(val, key=None):
     """Strip markdown artifacts and trailing explanations from model output."""
     val = val.replace("*", "")
@@ -67,12 +75,61 @@ def clean_response(val, key=None):
     return val
 
 
+def build_specialist_context(raw_obs):
+    """Build structured clinical context from specialist observations."""
+    return (
+        f"Specialist observations:\n"
+        f"- Shape (Architecture): {raw_obs['Architecture']}\n"
+        f"- Pigment network: {raw_obs['Network']}\n"
+        f"- Structures: {raw_obs['Structures']}\n"
+        f"- Colors: {raw_obs['Colors']}"
+    )
+
+
+def run_specialist_queries(vlm, image_uri):
+    """Run Phase 1 specialist queries on a single image and return cleaned observations."""
+    raw_obs = {}
+    vlm.reset()
+    for key, q in OBS_QUERIES.items():
+        res = vlm.create_chat_completion(
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_uri}},
+                    {"type": "text", "text": q}
+                ]
+            }],
+            max_tokens=32,
+            temperature=0.7,
+            repeat_penalty=1.5,
+        )
+        val = res["choices"][0]["message"]["content"].strip().lower()
+        raw_obs[key] = clean_response(val, key)
+        print(f"[BACKEND] Specialist ({key}): {val}")
+    return raw_obs
+
+
 class DermPipeline:
     def _encode_image_base64(self, image_path: str) -> str:
         """Read image file and return a data URI for llama-cpp-python chat API."""
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
+
+    def prepare_phase2_inputs(self, raw_obs, image_uri):
+        """Stage input triplet (context, image, prompt) for visual MedGemma Phase 2."""
+        context = build_specialist_context(raw_obs)
+        prompt = (
+            f"{context}\n\n"
+            "Based on the specialist observations above and the dermoscopic image, "
+            "provide a one-sentence clinical description of this lesion."
+        )
+        return {
+            "context": context,
+            "image_uri": image_uri,
+            "prompt": prompt,
+            "raw_obs": raw_obs,
+        }
 
     def _prepare_image(self, filename: str) -> str:
         original_path = os.path.join(DATA_DIR, filename)
@@ -87,7 +144,6 @@ class DermPipeline:
 
     def process(self, filename: str):
         processed_path = self._prepare_image(filename)
-        raw_obs = {}
         print(f"\n[BACKEND] >>> STARTING FRESH ANALYSIS: {filename}")
         
         try:
@@ -104,46 +160,19 @@ class DermPipeline:
             
             # Encode the processed image as base64 data URI for the chat API
             image_uri = self._encode_image_base64(processed_path)
-
-            # PaliGemma format (answer en mode) — not supported by MedGemma
-            # obs_queries = {
-            #     "Architecture": "answer en What is the shape of this image? round, oval, or irregular?",
-            #     "Network": "answer en Does this lesion have a pigment network? yes or no",
-            #     "Structures": "answer en Describe structures: dots, globules, or haze. Say clear if none",
-            #     "Colors": "answer en What colors are in this lesion?"
-            # }
-
-            # MedGemma format — direct clinical questions
-            obs_queries = {
-                "Architecture": "What is the shape of this lesion? Answer with one word: round, oval, or irregular.",
-                "Network": "Does this lesion have a pigment network? Answer with one word: yes or no.",
-                "Structures": "What structures are visible in this lesion? Answer briefly: dots, globules, streaks, or none.",
-                "Colors": "What colors are present in this lesion? Reply with only color names separated by commas, nothing else."
-            }
-
-            vlm.reset()  # Flush KV cache before querying new image
-            for key, q in obs_queries.items():
-                res = vlm.create_chat_completion(
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": image_uri}},
-                            {"type": "text", "text": q}
-                        ]
-                    }],
-                    max_tokens=32,
-                    temperature=0.7,
-                    repeat_penalty=1.5,
-                )
-                val = res["choices"][0]["message"]["content"].strip().lower()
-                raw_obs[key] = clean_response(val, key)
-                print(f"[BACKEND] Specialist ({key}): {val}")
+            raw_obs = run_specialist_queries(vlm, image_uri)
             
             # HARD RESET: Clean up memory immediately
             vlm.reset()
             del vlm
             gc.collect()
             time.sleep(0.5) # Brief pause for GPU VRAM deallocation
+
+            # STAGING: Prepare input triplet for future visual Phase 2
+            phase2_inputs = self.prepare_phase2_inputs(raw_obs, image_uri)
+            print(f"[BACKEND] Staged Phase 2 inputs: context={len(phase2_inputs['context'])} chars, "
+                  f"prompt={len(phase2_inputs['prompt'])} chars, "
+                  f"image_uri={'valid' if phase2_inputs['image_uri'].startswith('data:image/') else 'INVALID'}")
 
             # PHASE 2: MedGemma (The Reasoning Model)
             reasoner = Llama(model_path=MEDGEMMA_PATH, n_ctx=2048, n_gpu_layers=-1, verbose=False)
