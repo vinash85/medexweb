@@ -12,11 +12,11 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     build-essential \
+    cmake \
     git \
+    nano \
     libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
-
-RUN apt update && apt install -y nano
 
 # Set working directory
 WORKDIR /app
@@ -24,8 +24,12 @@ WORKDIR /app
 # Install Python dependencies
 # We install llama-cpp-python with CUDA support
 RUN pip3 install --upgrade pip
-#RUN CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip3 install llama-cpp-python
-RUN CMAKE_ARGS="-DGGML_CUDA=on" pip3 install llama-cpp-python
+# Symlink CUDA stub so linker finds libcuda.so.1 during build (real driver loads at runtime)
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+# 0.3.16 — supports gemma3 (MedGemma) + multimodal vision (PaliGemma)
+RUN LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" \
+    CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 \
+    pip3 install llama-cpp-python==0.3.16 --no-cache-dir
 RUN pip3 install mcp pillow flask pandas
 
 # Copy your server and client code into the container
