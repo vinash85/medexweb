@@ -72,9 +72,9 @@ def clean_response(val, key=None):
         val = ", ".join(found) if found else "none"
 
     if key == "Colors":
-        known_colors = ["red", "white", "blue", "black", "brown", "yellow", "pink", "orange", "gray", "tan"]
+        known_colors = ["white", "blue", "black", "brown", "yellow", "pink", "orange", "gray", "tan"]
         found = [c for c in known_colors if c in val]
-        val = ", ".join(found) if found else "unknown"
+        val = ", ".join(found) if found else "brown"
 
     return val
 
@@ -142,6 +142,10 @@ def clean_phase2_output(adj_desc):
     result = " ".join(cleaned)
     # Normalize whitespace
     result = re.sub(r"\s+", " ", result).strip()
+    # Scrub "red" color references — ubiquitous dermoscopic artifact that inflates color counts
+    result = re.sub(r'\bred[- ]brown\b', 'brown', result, flags=re.IGNORECASE)
+    result = re.sub(r'\breddish\b', 'brownish', result, flags=re.IGNORECASE)
+    result = re.sub(r'\bred\b', 'brown', result, flags=re.IGNORECASE)
     return result
 
 
@@ -163,8 +167,9 @@ def run_specialist_queries(vlm, image_uri):
             repeat_penalty=1.5,
         )
         val = res["choices"][0]["message"]["content"].strip().lower()
-        raw_obs[key] = clean_response(val, key)
-        print(f"[BACKEND] Specialist ({key}): {val}")
+        cleaned = clean_response(val, key)
+        raw_obs[key] = cleaned
+        print(f"[BACKEND] Specialist ({key}): {val} -> {cleaned}")
     return raw_obs
 
 
@@ -179,7 +184,7 @@ def run_phase2_description(vlm, phase2_inputs):
                 {"type": "text", "text": phase2_inputs["prompt"]}
             ]
         }],
-        max_tokens=512,
+        max_tokens=256,
         temperature=0.7,
         repeat_penalty=1.5,
     )
@@ -187,7 +192,15 @@ def run_phase2_description(vlm, phase2_inputs):
 
 
 def run_phase3_classification(text_model, phase3_inputs):
-    """Run Phase 3: text-only MedGemma classifies lesion from cleaned description + context."""
+    """Run Phase 3: rule-based MEL/NV + LLM-based BCC/BKL detection."""
+    raw_obs = phase3_inputs.get("raw_obs", {})
+    arch = raw_obs.get("Architecture", "").lower()
+    net = raw_obs.get("Network", "").lower()
+
+    # Rule-based MEL: requires irregular shape AND absent pigment network
+    is_mel = "irregular" in arch and "no" in net
+
+    # Ask LLM only for BCC/BKL detection from clinical description
     text_model.reset()
     res = text_model.create_chat_completion(
         messages=[{
@@ -195,16 +208,18 @@ def run_phase3_classification(text_model, phase3_inputs):
             "content": phase3_inputs["prompt"],
         }],
         max_tokens=16,
-        temperature=0.3,
+        temperature=0.1,
     )
     raw_output = res["choices"][0]["message"]["content"].strip().upper()
 
-    # Extract first valid code from response
-    for code in VALID_CODES:
+    # BCC/BKL from LLM takes priority over rule-based MEL/NV
+    for code in ["BCC", "BKL"]:
         if code in raw_output:
             return code, raw_output
 
-    # Fallback to NV if no valid code found
+    # Otherwise use rule-based MEL/NV
+    if is_mel:
+        return "MEL", f"RULE:irregular+no_network (LLM:{raw_output})"
     return "NV", raw_output
 
 
@@ -222,10 +237,12 @@ class DermPipeline:
             f"{context}\n\n"
             "Review the dermoscopic image and compare each observation above (shape, pigment "
             "network, structures, colors) with what is visible. For each, state whether it "
-            "is consistent or inconsistent with the image and explain briefly. "
-            "Then describe any additional dermoscopic features visible in the image that were "
-            "not mentioned, including overall pattern regularity, border definition, symmetry, "
-            "and any other notable features. "
+            "is consistent or inconsistent with the image in one sentence. "
+            "Then note any additional clearly visible dermoscopic features not mentioned above, "
+            "such as border definition, pattern regularity, or symmetry. "
+            "Be brief and factual. Only describe features you can clearly see. "
+            "Do not speculate about diagnoses or features that may or may not be present. "
+            "Do not mention red or reddish tones — these are common dermoscopic artifacts. "
             "Write in plain prose paragraphs only. Do not use tables or summary grids."
         )
         return {
@@ -246,18 +263,12 @@ class DermPipeline:
         prompt = (
             f"{context}\n\n"
             f"Clinical description:\n{cleaned_desc}\n\n"
-            "Classification guide:\n"
-            "- NV (nevus): regular or reticular pigment network, symmetric shape, "
-            "homogeneous pattern, single or few colors\n"
-            "- MEL (melanoma): atypical pigment network, asymmetric shape, irregular "
-            "pattern, multiple colors (3+), regression structures\n"
-            "- BCC (basal cell carcinoma): arborizing vessels, shiny white structures, "
-            "blue-grey ovoid nests, ulceration\n"
-            "- BKL (benign keratosis): comedo-like openings, milia-like cysts, gyri and "
-            "ridges, moth-eaten border\n\n"
-            "Most dermoscopic lesions are benign. Based on the specialist observations "
-            "and clinical description above, classify this skin lesion. "
-            "Respond with exactly one code: MEL, NV, BCC, or BKL."
+            "Does the clinical description indicate BCC or BKL?\n"
+            "- BCC: arborizing vessels, blue-grey ovoid nests, shiny white structures, "
+            "or ulceration\n"
+            "- BKL: comedo-like openings, milia-like cysts, or moth-eaten border\n"
+            "- NV: none of the above features\n\n"
+            "Respond with exactly one code: BCC, BKL, or NV."
         )
         return {
             "context": context,
