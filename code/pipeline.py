@@ -55,10 +55,19 @@ OBS_QUERIES = {
     "Architecture": "What is the shape of this lesion? Answer with one word: round, oval, or irregular.",
     "Network": "Does this lesion have a pigment network? Answer with one word: yes or no.",
     "Structures": "What structures are visible in this lesion? Answer briefly: dots, globules, streaks, or none.",
-    "Colors": "What colors are present in this lesion? Reply with only color names separated by commas, nothing else.",
+    "Colors": (
+        "What colors are present in this skin lesion? Check for: "
+        "light brown, dark brown, black, blue-gray, white, pink. "
+        "List only colors clearly visible, separated by commas."
+    ),
     "Vessels": "What type of blood vessels are visible in this lesion? Answer briefly: arborizing, dotted, linear, or none.",
     "Regression": "Are regression structures or blue-white veil visible in this lesion? Answer with one word: yes or no.",
-    "Keratosis": "Are comedo-like openings or milia-like cysts visible in this lesion? Answer with one word: yes or no.",
+    "Keratosis": (
+        "Look for small dark round plugs (comedo-like openings) or tiny bright white "
+        "dots/cysts (milia-like cysts) anywhere in this lesion. Are any present? "
+        "Answer with one word: yes or no."
+    ),
+    "Symmetry": "Is this lesion symmetric or asymmetric? Answer with one word: symmetric or asymmetric.",
 }
 
 # Phase 3 classification constants
@@ -83,12 +92,14 @@ def clean_response(val, key=None):
         val = ", ".join(found) if found else "brown"
 
     if key == "Vessels":
-        # Only keep dotted/linear — "arborizing" is hallucinated ubiquitously
-        found = [v for v in ["dotted", "linear"] if v in val]
+        found = [v for v in ["arborizing", "dotted", "linear"] if v in val]
         val = ", ".join(found) if found else "none"
 
     if key in ("Regression", "Keratosis"):
         val = "yes" if "yes" in val else "no"
+
+    if key == "Symmetry":
+        val = "asymmetric" if "asymmetric" in val else "symmetric"
 
     return val
 
@@ -108,6 +119,8 @@ def build_specialist_context(raw_obs):
         lines.append(f"- Regression/blue-white veil: {raw_obs['Regression']}")
     if "Keratosis" in raw_obs:
         lines.append(f"- Comedo-like openings/milia-like cysts: {raw_obs['Keratosis']}")
+    if "Symmetry" in raw_obs:
+        lines.append(f"- Symmetry: {raw_obs['Symmetry']}")
     return "\n".join(lines)
 
 
@@ -224,19 +237,42 @@ def run_phase3_classification(vlm, phase3_inputs):
     vessels = raw_obs.get("Vessels", "none").lower()
     regression = raw_obs.get("Regression", "no").lower()
     keratosis = raw_obs.get("Keratosis", "no").lower()
+    symmetry = raw_obs.get("Symmetry", "symmetric").lower()
+    colors = raw_obs.get("Colors", "brown").lower()
+    color_list = [c.strip() for c in colors.split(",")]
+    color_count = len(color_list)
 
-    # Rule-based BKL: comedo-like openings or milia-like cysts detected
+    # 1. BKL: keratosis features detected
     if "yes" in keratosis:
         return "BKL", "RULE:keratosis_features"
 
-    # Rule-based MEL: irregular shape AND (absent network OR regression/blue-white veil)
-    is_mel = "irregular" in arch and ("no" in net or "yes" in regression)
-    if is_mel:
-        reason = "irregular"
-        reason += "+no_network" if "no" in net else "+regression"
-        return "MEL", f"RULE:{reason}"
+    # 2a. BCC: arborizing vessels detected (now allowed back through filter)
+    if "arborizing" in vessels:
+        return "BCC", "RULE:arborizing_vessels"
 
-    # Ask LLM for BCC/BKL detection from clinical description (fallback)
+    # 2b. BCC: pink color (vascular component, strong BCC signal)
+    if "pink" in colors and "irregular" not in arch:
+        return "BCC", "RULE:pink_vascular"
+
+    # 3. MEL: require asymmetric + at least 2 other indicators
+    #    (Previously: irregular + no_network — fired on 50/99!)
+    mel_score = 0
+    if "irregular" in arch:
+        mel_score += 1
+    if "no" in net:
+        mel_score += 1
+    if "yes" in regression:
+        mel_score += 1
+    if "asymmetric" in symmetry:
+        mel_score += 1
+    if "blue" in colors:
+        mel_score += 1
+    if color_count >= 3:
+        mel_score += 1
+    if "asymmetric" in symmetry and mel_score >= 3:
+        return "MEL", f"RULE:mel_score_{mel_score}"
+
+    # 4. LLM fallback — now includes MEL option
     vlm.reset()
     res = vlm.create_chat_completion(
         messages=[{
@@ -248,8 +284,7 @@ def run_phase3_classification(vlm, phase3_inputs):
     )
     raw_output = res["choices"][0]["message"]["content"].strip().upper()
 
-    # BCC/BKL from LLM
-    for code in ["BCC", "BKL"]:
+    for code in ["MEL", "BCC", "BKL"]:
         if code in raw_output:
             return code, raw_output
 
@@ -312,16 +347,21 @@ class DermPipeline:
         """
         cleaned_desc = clean_phase2_output(adj_desc)
         context = build_specialist_context(raw_obs)
+        color_list = [c.strip() for c in raw_obs.get("Colors", "brown").split(",")]
+        color_note = f"Color diversity: {len(color_list)} color(s) detected ({raw_obs.get('Colors', 'brown')})\n"
         prompt = (
             f"{context}\n\n"
             f"Clinical description:\n{cleaned_desc}\n\n"
-            "Does the clinical description indicate BCC or BKL?\n"
+            f"{color_note}\n"
+            "Based on the clinical description, classify this lesion.\n"
+            "- MEL: asymmetric shape, multiple colors, irregular dots/globules, "
+            "regression structures, or blue-white veil\n"
             "- BCC: arborizing vessels, blue-grey ovoid nests, shiny white structures, "
             "or ulceration\n"
             "- BKL: comedo-like openings, milia-like cysts, moth-eaten border, "
             "clod pattern, fissures and ridges, or cerebriform pattern\n"
             "- NV: none of the above features\n\n"
-            "Respond with exactly one code: BCC, BKL, or NV."
+            "Respond with exactly one code: MEL, BCC, BKL, or NV."
         )
         return {
             "context": context,
