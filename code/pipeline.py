@@ -53,6 +53,9 @@ OBS_QUERIES = {
     "Network": "Does this lesion have a pigment network? Answer with one word: yes or no.",
     "Structures": "What structures are visible in this lesion? Answer briefly: dots, globules, streaks, or none.",
     "Colors": "What colors are present in this lesion? Reply with only color names separated by commas, nothing else.",
+    "Vessels": "What type of blood vessels are visible in this lesion? Answer briefly: arborizing, dotted, linear, or none.",
+    "Regression": "Are regression structures or blue-white veil visible in this lesion? Answer with one word: yes or no.",
+    "Keratosis": "Are comedo-like openings or milia-like cysts visible in this lesion? Answer with one word: yes or no.",
 }
 
 # Phase 3 classification constants
@@ -76,18 +79,33 @@ def clean_response(val, key=None):
         found = [c for c in known_colors if c in val]
         val = ", ".join(found) if found else "brown"
 
+    if key == "Vessels":
+        # Only keep dotted/linear — "arborizing" is hallucinated ubiquitously
+        found = [v for v in ["dotted", "linear"] if v in val]
+        val = ", ".join(found) if found else "none"
+
+    if key in ("Regression", "Keratosis"):
+        val = "yes" if "yes" in val else "no"
+
     return val
 
 
 def build_specialist_context(raw_obs):
     """Build structured clinical context from specialist observations."""
-    return (
-        f"Specialist observations:\n"
-        f"- Shape (Architecture): {raw_obs['Architecture']}\n"
-        f"- Pigment network: {raw_obs['Network']}\n"
-        f"- Structures: {raw_obs['Structures']}\n"
-        f"- Colors: {raw_obs['Colors']}"
-    )
+    lines = [
+        f"Specialist observations:",
+        f"- Shape (Architecture): {raw_obs['Architecture']}",
+        f"- Pigment network: {raw_obs['Network']}",
+        f"- Structures: {raw_obs['Structures']}",
+        f"- Colors: {raw_obs['Colors']}",
+    ]
+    if "Vessels" in raw_obs:
+        lines.append(f"- Vessels: {raw_obs['Vessels']}")
+    if "Regression" in raw_obs:
+        lines.append(f"- Regression/blue-white veil: {raw_obs['Regression']}")
+    if "Keratosis" in raw_obs:
+        lines.append(f"- Comedo-like openings/milia-like cysts: {raw_obs['Keratosis']}")
+    return "\n".join(lines)
 
 
 def clean_phase2_output(adj_desc):
@@ -185,22 +203,33 @@ def run_phase2_description(vlm, phase2_inputs):
             ]
         }],
         max_tokens=256,
-        temperature=0.7,
+        temperature=0.5,
         repeat_penalty=1.5,
     )
     return res["choices"][0]["message"]["content"].strip()
 
 
 def run_phase3_classification(text_model, phase3_inputs):
-    """Run Phase 3: rule-based MEL/NV + LLM-based BCC/BKL detection."""
+    """Run Phase 3: rule-based MEL/BCC/BKL + LLM fallback."""
     raw_obs = phase3_inputs.get("raw_obs", {})
     arch = raw_obs.get("Architecture", "").lower()
     net = raw_obs.get("Network", "").lower()
+    vessels = raw_obs.get("Vessels", "none").lower()
+    regression = raw_obs.get("Regression", "no").lower()
+    keratosis = raw_obs.get("Keratosis", "no").lower()
 
-    # Rule-based MEL: requires irregular shape AND absent pigment network
-    is_mel = "irregular" in arch and "no" in net
+    # Rule-based BKL: comedo-like openings or milia-like cysts detected
+    if "yes" in keratosis:
+        return "BKL", "RULE:keratosis_features"
 
-    # Ask LLM only for BCC/BKL detection from clinical description
+    # Rule-based MEL: irregular shape AND (absent network OR regression/blue-white veil)
+    is_mel = "irregular" in arch and ("no" in net or "yes" in regression)
+    if is_mel:
+        reason = "irregular"
+        reason += "+no_network" if "no" in net else "+regression"
+        return "MEL", f"RULE:{reason}"
+
+    # Ask LLM for BCC/BKL detection from clinical description (fallback)
     text_model.reset()
     res = text_model.create_chat_completion(
         messages=[{
@@ -208,18 +237,15 @@ def run_phase3_classification(text_model, phase3_inputs):
             "content": phase3_inputs["prompt"],
         }],
         max_tokens=16,
-        temperature=0.1,
+        temperature=0.2,
     )
     raw_output = res["choices"][0]["message"]["content"].strip().upper()
 
-    # BCC/BKL from LLM takes priority over rule-based MEL/NV
+    # BCC/BKL from LLM
     for code in ["BCC", "BKL"]:
         if code in raw_output:
             return code, raw_output
 
-    # Otherwise use rule-based MEL/NV
-    if is_mel:
-        return "MEL", f"RULE:irregular+no_network (LLM:{raw_output})"
     return "NV", raw_output
 
 
@@ -241,7 +267,8 @@ class DermPipeline:
             "Then note any additional clearly visible dermoscopic features not mentioned above, "
             "such as border definition, pattern regularity, symmetry, "
             "comedo-like openings (dark plugs), milia-like cysts (white dots), "
-            "fissures, ridges, or clod patterns. "
+            "fissures, ridges, clod patterns, "
+            "arborizing vessels, ulceration, or shiny white structures. "
             "Be brief and factual. Only describe features you can clearly see. "
             "Do not speculate about diagnoses or features that may or may not be present. "
             "Do not mention red or reddish tones — these are common dermoscopic artifacts. "
