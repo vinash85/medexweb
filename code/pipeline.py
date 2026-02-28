@@ -55,6 +55,11 @@ OBS_QUERIES = {
     "Colors": "What colors are present in this lesion? Reply with only color names separated by commas, nothing else.",
 }
 
+# Phase 3 classification constants
+VALID_CODES = ["MEL", "NV", "BCC", "BKL"]
+REFUSAL_PHRASES = ["i cannot", "i'm sorry", "as an ai", "not able to", "inappropriate"]
+SPECIAL_TOKENS = ["<start_of_turn>", "<end_of_turn>", "<eos>", "<pad>", "\u2581"]
+
 def clean_response(val, key=None):
     """Strip markdown artifacts and trailing explanations from model output."""
     val = val.replace("*", "")
@@ -83,6 +88,61 @@ def build_specialist_context(raw_obs):
         f"- Structures: {raw_obs['Structures']}\n"
         f"- Colors: {raw_obs['Colors']}"
     )
+
+
+def clean_phase2_output(adj_desc):
+    """Sentence-level cleaning of Phase 2 output.
+
+    Removes sentences containing refusal phrases, gibberish (repeated patterns,
+    special tokens, excessive non-ASCII, low alpha ratio), and normalizes whitespace.
+    """
+    if not adj_desc or not adj_desc.strip():
+        return ""
+
+    # Split into sentences (period/exclamation/question followed by space or end)
+    sentences = re.split(r'(?<=[.!?])\s+', adj_desc.strip())
+    cleaned = []
+
+    for sent in sentences:
+        lower = sent.lower()
+
+        # Skip sentences with refusal phrases
+        if any(phrase in lower for phrase in REFUSAL_PHRASES):
+            continue
+
+        # Skip sentences with special token leakage
+        if any(token in sent for token in SPECIAL_TOKENS):
+            continue
+
+        # Skip sentences with repeated patterns (same 3+ char substring repeated 3+ times)
+        has_repeat = False
+        for length in range(3, min(len(sent) // 3 + 1, 20)):
+            for start in range(len(sent) - length * 3 + 1):
+                substr = sent[start:start + length]
+                if substr * 3 in sent:
+                    has_repeat = True
+                    break
+            if has_repeat:
+                break
+        if has_repeat:
+            continue
+
+        # Skip sentences with excessive non-ASCII
+        non_ascii = sum(1 for c in sent if ord(c) > 127)
+        if len(sent) > 5 and non_ascii > len(sent) * 0.3:
+            continue
+
+        # Skip sentences with very low alpha ratio
+        alpha = sum(1 for c in sent if c.isalpha())
+        if len(sent) > 5 and alpha < len(sent) * 0.4:
+            continue
+
+        cleaned.append(sent)
+
+    result = " ".join(cleaned)
+    # Normalize whitespace
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
 
 
 def run_specialist_queries(vlm, image_uri):
@@ -126,6 +186,28 @@ def run_phase2_description(vlm, phase2_inputs):
     return res["choices"][0]["message"]["content"].strip()
 
 
+def run_phase3_classification(text_model, phase3_inputs):
+    """Run Phase 3: text-only MedGemma classifies lesion from cleaned description + context."""
+    text_model.reset()
+    res = text_model.create_chat_completion(
+        messages=[{
+            "role": "user",
+            "content": phase3_inputs["prompt"],
+        }],
+        max_tokens=16,
+        temperature=0.3,
+    )
+    raw_output = res["choices"][0]["message"]["content"].strip().upper()
+
+    # Extract first valid code from response
+    for code in VALID_CODES:
+        if code in raw_output:
+            return code, raw_output
+
+    # Fallback to NV if no valid code found
+    return "NV", raw_output
+
+
 class DermPipeline:
     def _encode_image_base64(self, image_path: str) -> str:
         """Read image file and return a data URI for llama-cpp-python chat API."""
@@ -141,14 +223,45 @@ class DermPipeline:
             "Review the dermoscopic image and compare each observation above (shape, pigment "
             "network, structures, colors) with what is visible. For each, state whether it "
             "is consistent or inconsistent with the image and explain briefly. "
-            "Then list any additional dermoscopic features visible in the image that were "
-            "not mentioned, such as asymmetry, border irregularity, regression structures, "
-            "vascular patterns, or other notable features. "
+            "Then describe any additional dermoscopic features visible in the image that were "
+            "not mentioned, including overall pattern regularity, border definition, symmetry, "
+            "and any other notable features. "
             "Write in plain prose paragraphs only. Do not use tables or summary grids."
         )
         return {
             "context": context,
             "image_uri": image_uri,
+            "prompt": prompt,
+            "raw_obs": raw_obs,
+        }
+
+    def prepare_phase3_inputs(self, raw_obs, adj_desc):
+        """Stage inputs for text-only Phase 3 classification.
+
+        Cleans Phase 2 output, combines with Phase 1 context, and builds
+        classification prompt.
+        """
+        cleaned_desc = clean_phase2_output(adj_desc)
+        context = build_specialist_context(raw_obs)
+        prompt = (
+            f"{context}\n\n"
+            f"Clinical description:\n{cleaned_desc}\n\n"
+            "Classification guide:\n"
+            "- NV (nevus): regular or reticular pigment network, symmetric shape, "
+            "homogeneous pattern, single or few colors\n"
+            "- MEL (melanoma): atypical pigment network, asymmetric shape, irregular "
+            "pattern, multiple colors (3+), regression structures\n"
+            "- BCC (basal cell carcinoma): arborizing vessels, shiny white structures, "
+            "blue-grey ovoid nests, ulceration\n"
+            "- BKL (benign keratosis): comedo-like openings, milia-like cysts, gyri and "
+            "ridges, moth-eaten border\n\n"
+            "Most dermoscopic lesions are benign. Based on the specialist observations "
+            "and clinical description above, classify this skin lesion. "
+            "Respond with exactly one code: MEL, NV, BCC, or BKL."
+        )
+        return {
+            "context": context,
+            "cleaned_description": cleaned_desc,
             "prompt": prompt,
             "raw_obs": raw_obs,
         }
@@ -210,40 +323,41 @@ class DermPipeline:
 
             del reasoner
             gc.collect()
+            time.sleep(0.5)
 
-            # --- PHASE 3: Classification + Logic Gate (decoupled — to be updated separately) ---
-            # class_prompt = f"<start_of_turn>user\nDescription: {adj_desc}\nCode: MEL, NV, BCC, or BKL.<end_of_turn>\n<start_of_turn>model\nCODE: "
-            # class_res = reasoner.create_completion(prompt=class_prompt, max_tokens=10)
-            # raw_code = class_res["choices"][0]["text"].strip().upper()
-            #
-            # final_code = "UNKNOWN"
-            # for code in ["MEL", "NV", "BCC", "BKL"]:
-            #     if code in raw_code: final_code = code; break
-            #
-            # color_text = raw_obs['Colors']
-            # detected_colors = [c for c in ["red", "white", "blue", "black", "brown"] if c in color_text]
-            #
-            # has_blue_red = any(c in detected_colors for c in ["blue", "red"])
-            # print(f"[BACKEND] Logic Check - Colors: {detected_colors} | Risk: {'HIGH' if has_blue_red else 'NORMAL'}")
-            #
-            # if has_blue_red or len(detected_colors) >= 4:
-            #     final_code = "MEL"
-            #     print("[BACKEND] Result: High Risk Overrule to MEL")
-            # elif final_code == "UNKNOWN":
-            #     final_code = "NV"
-            #
-            # report = (
-            #     f"--- DERMATOLOGY AI ADJUDICATION ---\n"
-            #     f"FINAL CLASSIFICATION: {final_code}\n\n"
-            #     f"CLINICAL SUMMARY:\n{adj_desc}\n\n"
-            #     f"SPECIALIST DATA:\n"
-            #     f"- Architecture: {raw_obs['Architecture']}\n"
-            #     f"- Colors: {raw_obs['Colors']}\n"
-            #     f"------------------------------------"
-            # )
-            # return {"ai_code": final_code, "final_implication": report}
+            # STAGING: Prepare Phase 3 inputs (cleans Phase 2 output)
+            phase3_inputs = self.prepare_phase3_inputs(raw_obs, adj_desc)
+            print(f"[BACKEND] Staged Phase 3 inputs: cleaned_desc={len(phase3_inputs['cleaned_description'])} chars")
 
-            return {"adj_desc": adj_desc, "raw_obs": raw_obs}
+            # PHASE 3: Text-only MedGemma classification (no CLIP projector)
+            text_model = Llama(
+                model_path=MEDGEMMA_PATH,
+                n_ctx=2048,
+                n_gpu_layers=-1,
+                chat_format="medgemma-direct",
+                verbose=False,
+            )
+            code, raw_class = run_phase3_classification(text_model, phase3_inputs)
+            print(f"[BACKEND] Phase 3 Classification: {code} (raw: {raw_class})")
+
+            del text_model
+            gc.collect()
+
+            report = (
+                f"--- DERMATOLOGY AI ADJUDICATION ---\n"
+                f"FINAL CLASSIFICATION: {code}\n\n"
+                f"CLINICAL SUMMARY:\n{adj_desc}\n\n"
+                f"SPECIALIST DATA:\n"
+                f"- Architecture: {raw_obs['Architecture']}\n"
+                f"- Colors: {raw_obs['Colors']}\n"
+                f"------------------------------------"
+            )
+            return {
+                "ai_code": code,
+                "adj_desc": adj_desc,
+                "raw_obs": raw_obs,
+                "final_implication": report,
+            }
             
         finally:
             if os.path.exists(processed_path):
