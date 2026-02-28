@@ -1,11 +1,10 @@
 import os
 import gc
 import re
-import json
 import uuid
 import time
 import base64
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 from llama_cpp import Llama
 from llama_cpp.llama_chat_format import register_chat_format, ChatFormatterResponse
 
@@ -109,6 +108,24 @@ def run_specialist_queries(vlm, image_uri):
     return raw_obs
 
 
+def run_phase2_description(vlm, phase2_inputs):
+    """Run Phase 2: visual MedGemma generates clinical description from image + context."""
+    vlm.reset()
+    res = vlm.create_chat_completion(
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": phase2_inputs["image_uri"]}},
+                {"type": "text", "text": phase2_inputs["prompt"]}
+            ]
+        }],
+        max_tokens=100,
+        temperature=0.7,
+        repeat_penalty=1.5,
+    )
+    return res["choices"][0]["message"]["content"].strip()
+
+
 class DermPipeline:
     def _encode_image_base64(self, image_path: str) -> str:
         """Read image file and return a data URI for llama-cpp-python chat API."""
@@ -174,58 +191,54 @@ class DermPipeline:
                   f"prompt={len(phase2_inputs['prompt'])} chars, "
                   f"image_uri={'valid' if phase2_inputs['image_uri'].startswith('data:image/') else 'INVALID'}")
 
-            # PHASE 2: MedGemma (The Reasoning Model)
-            reasoner = Llama(model_path=MEDGEMMA_PATH, n_ctx=2048, n_gpu_layers=-1, verbose=False)
-            
-            case_id = uuid.uuid4().hex[:4].upper()
-            desc_prompt = (
-                f"<start_of_turn>user\n"
-                f"DATA: {raw_obs['Architecture']} shape, network: {raw_obs['Network']}, features: {raw_obs['Structures']}.\n"
-                "In one sentence, describe the clinical appearance.<end_of_turn>\n"
-                f"<start_of_turn>model\n"
+            # PHASE 2: Visual MedGemma (description generation)
+            reasoner = Llama(
+                model_path=MEDGEMMA_PATH,
+                clip_model_path=SPECIALIST_PROJ,
+                n_ctx=2048,
+                n_gpu_layers=-1,
+                chat_format="medgemma-direct",
+                verbose=False
             )
-            desc_res = reasoner.create_completion(prompt=desc_prompt, max_tokens=100)
-            adj_desc = desc_res["choices"][0]["text"].strip()
-            print(f"[BACKEND] Adjudicator Description: {adj_desc}")
-
-            class_prompt = f"<start_of_turn>user\nDescription: {adj_desc}\nCode: MEL, NV, BCC, or BKL.<end_of_turn>\n<start_of_turn>model\nCODE: "
-            class_res = reasoner.create_completion(prompt=class_prompt, max_tokens=10)
-            raw_code = class_res["choices"][0]["text"].strip().upper()
-
-            # PHASE 3: LOGIC GATE & OVERRIDE
-            final_code = "UNKNOWN"
-            for code in ["MEL", "NV", "BCC", "BKL"]:
-                if code in raw_code: final_code = code; break
-            
-            # Strict Color Check
-            color_text = raw_obs['Colors']
-            # We filter out colors only if the model clearly detected them
-            detected_colors = [c for c in ["red", "white", "blue", "black", "brown"] if c in color_text]
-            
-            # Risk Analysis
-            has_blue_red = any(c in detected_colors for c in ["blue", "red"])
-            print(f"[BACKEND] Logic Check - Colors: {detected_colors} | Risk: {'HIGH' if has_blue_red else 'NORMAL'}")
-
-            # Only override if the Specialist actually found High Risk colors
-            if has_blue_red or len(detected_colors) >= 4:
-                final_code = "MEL"
-                print("[BACKEND] Result: High Risk Overrule to MEL")
-            elif final_code == "UNKNOWN":
-                final_code = "NV"
+            adj_desc = run_phase2_description(reasoner, phase2_inputs)
+            print(f"[BACKEND] Phase 2 Description: {adj_desc}")
 
             del reasoner
             gc.collect()
 
-            report = (
-                f"--- DERMATOLOGY AI ADJUDICATION ---\n"
-                f"FINAL CLASSIFICATION: {final_code}\n\n"
-                f"CLINICAL SUMMARY:\n{adj_desc}\n\n"
-                f"SPECIALIST DATA:\n"
-                f"- Architecture: {raw_obs['Architecture']}\n"
-                f"- Colors: {raw_obs['Colors']}\n"
-                f"------------------------------------"
-            )
-            return {"ai_code": final_code, "final_implication": report}
+            # --- PHASE 3: Classification + Logic Gate (decoupled — to be updated separately) ---
+            # class_prompt = f"<start_of_turn>user\nDescription: {adj_desc}\nCode: MEL, NV, BCC, or BKL.<end_of_turn>\n<start_of_turn>model\nCODE: "
+            # class_res = reasoner.create_completion(prompt=class_prompt, max_tokens=10)
+            # raw_code = class_res["choices"][0]["text"].strip().upper()
+            #
+            # final_code = "UNKNOWN"
+            # for code in ["MEL", "NV", "BCC", "BKL"]:
+            #     if code in raw_code: final_code = code; break
+            #
+            # color_text = raw_obs['Colors']
+            # detected_colors = [c for c in ["red", "white", "blue", "black", "brown"] if c in color_text]
+            #
+            # has_blue_red = any(c in detected_colors for c in ["blue", "red"])
+            # print(f"[BACKEND] Logic Check - Colors: {detected_colors} | Risk: {'HIGH' if has_blue_red else 'NORMAL'}")
+            #
+            # if has_blue_red or len(detected_colors) >= 4:
+            #     final_code = "MEL"
+            #     print("[BACKEND] Result: High Risk Overrule to MEL")
+            # elif final_code == "UNKNOWN":
+            #     final_code = "NV"
+            #
+            # report = (
+            #     f"--- DERMATOLOGY AI ADJUDICATION ---\n"
+            #     f"FINAL CLASSIFICATION: {final_code}\n\n"
+            #     f"CLINICAL SUMMARY:\n{adj_desc}\n\n"
+            #     f"SPECIALIST DATA:\n"
+            #     f"- Architecture: {raw_obs['Architecture']}\n"
+            #     f"- Colors: {raw_obs['Colors']}\n"
+            #     f"------------------------------------"
+            # )
+            # return {"ai_code": final_code, "final_implication": report}
+
+            return {"adj_desc": adj_desc, "raw_obs": raw_obs}
             
         finally:
             if os.path.exists(processed_path):
