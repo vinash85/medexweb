@@ -119,7 +119,7 @@ def run_phase2_description(vlm, phase2_inputs):
                 {"type": "text", "text": phase2_inputs["prompt"]}
             ]
         }],
-        max_tokens=100,
+        max_tokens=512,
         temperature=0.7,
         repeat_penalty=1.5,
     )
@@ -138,8 +138,13 @@ class DermPipeline:
         context = build_specialist_context(raw_obs)
         prompt = (
             f"{context}\n\n"
-            "Based on the specialist observations above and the dermoscopic image, "
-            "provide a one-sentence clinical description of this lesion."
+            "Review the dermoscopic image and compare each observation above (shape, pigment "
+            "network, structures, colors) with what is visible. For each, state whether it "
+            "is consistent or inconsistent with the image and explain briefly. "
+            "Then list any additional dermoscopic features visible in the image that were "
+            "not mentioned, such as asymmetry, border irregularity, regression structures, "
+            "vascular patterns, or other notable features. "
+            "Write in plain prose paragraphs only. Do not use tables or summary grids."
         )
         return {
             "context": context,
