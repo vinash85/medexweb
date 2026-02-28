@@ -138,13 +138,13 @@ class DermPipeline:
         context = build_specialist_context(raw_obs)
         prompt = (
             f"{context}\n\n"
-            "The above observations were made by a dermoscopic image analysis system. "
-            "Review the dermoscopic image and compare each observation (shape, pigment network, "
-            "structures, colors) with what is visible. For each, state whether the observation "
+            "Review the dermoscopic image and compare each observation above (shape, pigment "
+            "network, structures, colors) with what is visible. For each, state whether it "
             "is consistent or inconsistent with the image and explain briefly. "
             "Then list any additional dermoscopic features visible in the image that were "
-            "not mentioned above, such as asymmetry, border irregularity, regression structures, "
-            "vascular patterns, or other notable features."
+            "not mentioned, such as asymmetry, border irregularity, regression structures, "
+            "vascular patterns, or other notable features. "
+            "Write in plain prose paragraphs only. Do not use tables or summary grids."
         )
         return {
             "context": context,
