@@ -2,8 +2,9 @@
 """
 Multi-VLM Dermoscopy Attribute Benchmark
 =========================================
-Benchmarks vision-language models on 4 dermoscopy attributes across a
-stratified 20-image sample (5 MEL, 5 NV, 5 BCC, 5 BKL).
+Benchmarks vision-language models on 8 dermoscopy attributes across a
+stratified sample from all 6 lesion classes (MEL, NV, BCC, BKL, AKIEC, DF).
+Up to 5 images per class (fewer when the dataset has fewer).
 
 Run inside Docker:
     python3 /home/project/code/test_vlm_benchmark.py
@@ -117,20 +118,47 @@ ATTRIBUTE_QUERIES = {
         "or dark comedo-like openings visible in this lesion? "
         "Answer with one of: absent, milia_only, comedo_only, milia+comedo."
     ),
+    "Vascular_Structures": (
+        "Examine the lesion for blood vessel patterns. Are there arborizing (tree-like branching) "
+        "vessels, dotted/glomerular vessels, or other prominent vascular structures? "
+        "Answer with one of: absent, arborizing, dotted_glomerular, other_vascular."
+    ),
+    "Blue_White_Structures": (
+        "Does the lesion contain blue-white veil (structureless blue-white area), "
+        "shiny white lines/blotches/strands, or white clods? "
+        "Answer with one of: absent, blue_white_veil, shiny_white, white_clods, present_unspecified."
+    ),
+    "Scale_Surface": (
+        "Does the lesion surface show scale, crust, or textured surface features "
+        "such as gyri/ridges (brain-like pattern) or a moth-eaten border? "
+        "Answer with one of: absent, scale_crust, gyri_ridges, moth_eaten, present_unspecified."
+    ),
+    "Blotches": (
+        "Are there dark structureless areas (blotches) within the lesion? "
+        "If present, are they symmetric/regular or asymmetric/irregular? "
+        "Answer with one of: absent, symmetric, asymmetric, present_unspecified."
+    ),
 }
 
-# ── 20-Image Stratified Sample (5 per class, sorted by ISIC ID) ──────────────
-SAMPLE_CLASSES = ["mel", "nv", "bcc", "bkl"]
+# ── Stratified Sample (up to 5 per class, all 6 lesion types) ────────────────
+SAMPLE_CLASSES = ["mel", "nv", "bcc", "bkl", "akiec", "df"]
 N_PER_CLASS = 5
 
 
 def select_sample_images():
-    """Select 5 images per class from DermsGemms.csv, sorted by Image ID."""
+    """Select up to N_PER_CLASS images per class from DermsGemms.csv.
+
+    Takes all available images for classes with fewer than N_PER_CLASS samples.
+    """
     df = pd.read_csv(CSV_PATH)
     df.columns = [c.strip() for c in df.columns]
     sample_rows = []
     for dx in SAMPLE_CLASSES:
         subset = df[df["Dx"] == dx].sort_values("Image").head(N_PER_CLASS)
+        n_available = len(df[df["Dx"] == dx])
+        n_selected = len(subset)
+        if n_selected < N_PER_CLASS:
+            print(f"  Note: {dx} has only {n_available} image(s), using all of them")
         for _, row in subset.iterrows():
             sample_rows.append({
                 "image_id": row["Image"],
@@ -273,6 +301,54 @@ def clean_attribute_response(raw, attr_key):
             return "absent"
         return "unclear"
 
+    elif attr_key == "Vascular_Structures":
+        if "arboriz" in text or "branch" in text or "tree" in text:
+            return "arborizing"
+        if "dotted" in text or "glomerul" in text or "punctate" in text:
+            return "dotted_glomerular"
+        if "vessel" in text or "vascular" in text or "capillar" in text or "telangi" in text:
+            return "other_vascular"
+        if "absent" in text or "no " in text or "none" in text or "not " in text:
+            return "absent"
+        return "unclear"
+
+    elif attr_key == "Blue_White_Structures":
+        if "blue" in text and ("white" in text or "veil" in text):
+            return "blue_white_veil"
+        if "shiny" in text or ("white" in text and ("line" in text or "strand" in text or "blotch" in text)):
+            return "shiny_white"
+        if "white" in text and "clod" in text:
+            return "white_clods"
+        if "present" in text or "yes" in text or "white" in text or "blue" in text:
+            return "present_unspecified"
+        if "absent" in text or "no " in text or "none" in text or "not " in text:
+            return "absent"
+        return "unclear"
+
+    elif attr_key == "Scale_Surface":
+        if "scale" in text or "crust" in text or "kerat" in text:
+            return "scale_crust"
+        if "gyri" in text or "ridge" in text or "brain" in text or "cerebriform" in text:
+            return "gyri_ridges"
+        if "moth" in text or "eaten" in text:
+            return "moth_eaten"
+        if "present" in text or "yes" in text or "rough" in text or "texture" in text:
+            return "present_unspecified"
+        if "absent" in text or "no " in text or "none" in text or "not " in text or "smooth" in text:
+            return "absent"
+        return "unclear"
+
+    elif attr_key == "Blotches":
+        if "asymmetri" in text or "irregular" in text or "atypical" in text:
+            return "asymmetric"
+        if "symmetri" in text or "regular" in text or "uniform" in text:
+            return "symmetric"
+        if "present" in text or "yes" in text or "blotch" in text or "structureless" in text:
+            return "present_unspecified"
+        if "absent" in text or "no " in text or "none" in text or "not " in text:
+            return "absent"
+        return "unclear"
+
     return "unclear"
 
 
@@ -286,7 +362,11 @@ def run_benchmark():
 
     # Select sample images
     sample = select_sample_images()
-    print(f"\nSample: {len(sample)} images ({N_PER_CLASS} per class)")
+    class_counts = {}
+    for s in sample:
+        class_counts[s["dx"]] = class_counts.get(s["dx"], 0) + 1
+    class_desc = ", ".join(f"{dx.upper()}={n}" for dx, n in class_counts.items())
+    print(f"\nSample: {len(sample)} images ({class_desc})")
     for s in sample:
         print(f"  {s['image_id']} ({s['dx']})")
 
@@ -413,11 +493,11 @@ def run_benchmark():
                         row[f"{attr_key}_clean"] = "ERROR"
 
                 all_results.append(row)
-                print(f"  [{img_idx+1}/{len(sample)}] {image_id}: "
-                      f"PN={row.get('Pigment_Network_clean','?')} "
-                      f"DG={row.get('Dots_Globules_clean','?')} "
-                      f"ST={row.get('Streaks_clean','?')} "
-                      f"MC={row.get('Milia_Cysts_clean','?')}")
+                attr_summary = " ".join(
+                    f"{k[:2]}={row.get(f'{k}_clean', '?')}"
+                    for k in ATTRIBUTE_QUERIES
+                )
+                print(f"  [{img_idx+1}/{len(sample)}] {image_id}: {attr_summary}")
 
             # Unload model
             print(f"  Unloading {model_name}...")
@@ -462,7 +542,11 @@ def run_benchmark():
     summary_lines.append("=" * 70)
     summary_lines.append("Multi-VLM Dermoscopy Attribute Benchmark — Summary")
     summary_lines.append(f"Generated: {datetime.now().isoformat()}")
-    summary_lines.append(f"Images: {len(sample)} ({N_PER_CLASS} per class)")
+    class_counts = {}
+    for s in sample:
+        class_counts[s["dx"]] = class_counts.get(s["dx"], 0) + 1
+    class_desc = ", ".join(f"{dx.upper()}={n}" for dx, n in class_counts.items())
+    summary_lines.append(f"Images: {len(sample)} ({class_desc})")
     summary_lines.append(f"Attributes: {', '.join(ATTRIBUTE_QUERIES.keys())}")
     summary_lines.append("=" * 70)
 
