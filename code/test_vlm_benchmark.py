@@ -23,6 +23,20 @@ import traceback
 from datetime import datetime
 
 import pandas as pd
+from llama_cpp.llama_chat_format import register_chat_format, ChatFormatterResponse
+
+# Register a raw pass-through chat format for PaliGemma base
+@register_chat_format("paligemma-raw")
+def paligemma_raw_handler(messages, **kwargs):
+    prompt = ""
+    for msg in messages:
+        if isinstance(msg["content"], list):
+            for part in msg["content"]:
+                if part["type"] == "text":
+                    prompt += part["text"]
+        elif isinstance(msg["content"], str):
+            prompt += msg["content"]
+    return ChatFormatterResponse(prompt=prompt + "\n")
 from PIL import Image, ImageEnhance
 
 # ── Paths (Docker layout) ────────────────────────────────────────────────────
@@ -210,13 +224,18 @@ def load_model(config):
         handler = MedGemmaChatHandler(clip_model_path=mmproj_path, verbose=False)
 
     elif handler_type == "paligemma":
-        # Try PaliGemmaChatHandler, fallback to Llava15ChatHandler
-        try:
-            from llama_cpp.llama_chat_format import PaliGemmaChatHandler
-            handler = PaliGemmaChatHandler(clip_model_path=mmproj_path, verbose=False)
-        except (ImportError, AttributeError):
-            print(f"  [INFO] PaliGemmaChatHandler not available, using Llava15ChatHandler")
-            handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
+        # PaliGemma uses SigLIP (not CLIP) — loading mmproj through a
+        # Llava15ChatHandler causes a segfault.  Pass clip_model_path
+        # directly to the Llama() constructor and use a raw chat format.
+        llm = Llama(
+            model_path=model_path,
+            clip_model_path=mmproj_path,
+            n_ctx=n_ctx,
+            n_gpu_layers=-1,
+            chat_format="paligemma-raw",
+            verbose=False,
+        )
+        return llm, None
 
     elif handler_type == "llama3vision":
         # Uses built-in chat_format string, no custom handler
