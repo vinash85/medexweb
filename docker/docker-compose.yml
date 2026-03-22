@@ -3,6 +3,12 @@ services:
     build: .
     image: derm-mcp
     container_name: medex-derm
+    privileged: true
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DISABLE_REQUIRE=true
     deploy:
       resources:
         reservations:

@@ -1,11 +1,14 @@
 # Use NVIDIA CUDA base for GPU acceleration
-FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
+FROM nvidia/cuda:12.6.3-devel-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     CUDA_DOCKER_ARCH=all \
-    LLAMA_CUBLAS=1
+    LLAMA_CUBLAS=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_DISABLE_REQUIRE=true
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
